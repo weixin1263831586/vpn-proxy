@@ -9,12 +9,25 @@ if ! id rk-vpn-proxy >/dev/null 2>&1; then
     useradd --system --user-group --no-create-home --home-dir /nonexistent \
         --shell /usr/sbin/nologin rk-vpn-proxy
 fi
-if ! command -v squid >/dev/null; then
-    # Prevent the distribution's default, broad listener from starting on install.
-    systemctl mask squid.service
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y squid nftables
+# Refuse to silently disrupt an existing distribution Squid deployment.
+if systemctl is-active --quiet squid.service; then
+    echo 'squid.service is active. Stop/migrate it explicitly before installing the dedicated proxy.' >&2
+    exit 1
 fi
+# An already installed Squid binary does not guarantee nft is installed.
+missing=()
+command -v squid >/dev/null 2>&1 || missing+=(squid)
+command -v nft >/dev/null 2>&1 || missing+=(nftables)
+if (("${#missing[@]}" > 0)); then
+    # Prevent the distribution's default wildcard listener during package installation.
+    if [[ " ${missing[*]} " == *" squid "* ]]; then
+        systemctl mask squid.service
+    fi
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+fi
+command -v nft >/dev/null 2>&1 || { echo 'Missing nft binary after installation.' >&2; exit 1; }
+command -v squid >/dev/null 2>&1 || { echo 'Missing squid binary after installation.' >&2; exit 1; }
 install -d -m 0755 /etc/rk-vpn-proxy /usr/local/libexec
 if [[ -f /etc/rk-vpn-proxy/squid.conf ]]; then
     cp -a /etc/rk-vpn-proxy/squid.conf "/etc/rk-vpn-proxy/squid.conf.bak.$(date +%Y%m%d-%H%M%S)"

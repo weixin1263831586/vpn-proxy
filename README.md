@@ -2,7 +2,20 @@
 
 目标路径：`10.10.10.206 → 172.16.14.233:7897 → ppp0 → 互联网`。
 
-## 一键安装
+## 安全安装（推荐）
+
+脚本通过 SSH 读取可信代理主机上的本地文件，避免从未加密的 HTTP 服务获取可执行 Shell 代码。
+首次 SSH 连接请核对主机密钥指纹，确保文件来自受信任的机器。命令在编译服务器 10.10.10.206 的 Bash 中运行：
+
+```bash
+source <(ssh -o StrictHostKeyChecking=ask hcq@172.16.14.233 'cat /home/hcq/vpn-proxy/client-install.sh')
+```
+
+如果编译服务器不能使用 SSH，可在受信任通道下先复制文件、核对哈希后再 source。
+通过 8089 HTTP 地址下载并立即执行的旧方式仍保留作兼容，但不建议用于正式部署。
+8089 服务仅检查来源 IP，不等于提供脚本内容真实性或完整性保障。
+
+## 一键安装（旧版 HTTP 方式，不推荐）
 
 在编译服务器 `10.10.10.206` 的 Bash 终端执行：
 
@@ -111,3 +124,10 @@ export https_proxy="$http_proxy" HTTP_PROXY="$http_proxy" HTTPS_PROXY="$http_pro
 
 规则依据：[Squid DNS 配置](https://www.squid-cache.org/Doc/config/dns_nameservers/)、
 [nftables 用户匹配](https://wiki.nftables.org/wiki-nftables/index.php/Matching_packet_metainformation)。
+
+## 安装安全性及监控说明
+
+- `health.sh` 在 VPN 接口、路由或 HTTP 出口探测失败时返回非零退出码；`rk-vpn-proxy-health.service` 的状态可以反映探测异常。定时器下次仍会再次执行。
+- `install.sh` 将检测已启动的发行版 `squid.service`，发现冲突会退出，不会自动终止现有代理；如需迁移请先核对现有监听与用户。
+- `check-client.sh` 现在检查 HTTPS CONNECT 建立和证书验证，检测失败会返回非零值；目标网站 HTTP 403 等响应不直接视为代理失败。
+- 上述更改不替代真实的 VPN 断线注入测试与部署时端到端验证。

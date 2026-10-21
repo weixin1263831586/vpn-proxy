@@ -12,21 +12,21 @@ log_change() {
 }
 if ! ip -4 address show dev ppp0 2>/dev/null | grep -q 'inet '; then
     log_change 'VPN DOWN: ppp0 has no IPv4 address; proxy fallback is blocked.'
-    exit 0
+    exit 1
 fi
 if ! ip -4 route get 8.8.8.8 | grep -q 'dev ppp0'; then
     log_change 'VPN ROUTE WARNING: public DNS route is not ppp0; proxy fallback is blocked.'
-    exit 0
+    exit 1
 fi
 if ! exit_ip=$(curl --silent --show-error --fail --noproxy '' \
     --proxy http://127.0.0.1:17897 --connect-timeout 15 --max-time 30 \
     https://api.ipify.org); then
     log_change 'VPN PROBE FAILED: HTTPS request through the proxy failed.'
-    exit 0
+    exit 1
 fi
 if [[ ! "$exit_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
     log_change 'VPN PROBE FAILED: invalid public IP response.'
-    exit 0
+    exit 1
 fi
 if [[ -f "$state_dir/exit-ip" ]]; then
     previous_ip=$(cat "$state_dir/exit-ip")
