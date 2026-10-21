@@ -16,11 +16,12 @@ SPEC.loader.exec_module(BUILDER)
 
 
 class GeneralDeploymentTests(unittest.TestCase):
-    def test_private_networks_and_public_denial(self):
+    def test_explicit_client_allowlist_and_public_denial(self):
         config = load_config()
-        for address in ("10.2.3.4", "172.20.8.9", "192.168.8.20"):
+        for address in ("10.10.10.206", "172.16.14.66", "127.0.0.1"):
             self.assertTrue(client_allowed(address, config))
-        self.assertFalse(client_allowed("203.0.113.8", config))
+        for address in ("10.2.3.4", "172.20.8.9", "192.168.8.20", "203.0.113.8"):
+            self.assertFalse(client_allowed(address, config))
         config["allowed_clients"] = ["192.168.8.0/24"]
         self.assertTrue(client_allowed("192.168.8.70", config))
         self.assertFalse(client_allowed("192.168.9.70", config))
@@ -30,7 +31,8 @@ class GeneralDeploymentTests(unittest.TestCase):
         config = load_config()
         config.update(listen_host="192.168.50.1", advertise_host="vpn.example.test",
                       proxy_port=8765, health_port=18765, installer_port=8090,
-                      vpn_interface="tun8", allowed_clients=["192.168.50.0/24"])
+                      vpn_interface="tun8", allowed_clients=["192.168.50.0/24"],
+                      no_proxy=["localhost", "127.0.0.1", "::1"])
         outputs = BUILDER.render(config)
         self.assertIn("http_port 192.168.50.1:8765", outputs["squid.conf"])
         self.assertIn("acl allowed_clients src 192.168.50.0/24", outputs["squid.conf"])
@@ -83,6 +85,10 @@ class GeneralDeploymentTests(unittest.TestCase):
                      "test", str(installer), "http://other.example:8765"],
                     env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                from stat import S_IMODE
+                proxy_dir = home / ".config/rk-vpn-proxy"
+                self.assertEqual(S_IMODE(proxy_dir.stat().st_mode), 0o700)
+                self.assertEqual(S_IMODE((proxy_dir / "env.sh").stat().st_mode), 0o600)
                 for filename in (".bashrc", ".profile", ".bash_profile"):
                     self.assertEqual((home / filename).read_text().count("# rk-vpn-proxy environment"), 1)
                 self.assertEqual(len(list((home / ".config/rk-vpn-proxy/backups").iterdir())), 2)

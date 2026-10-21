@@ -27,6 +27,8 @@ read -r connect_status http_status <<< "$probe"
 }
 client_dir="$HOME/.config/rk-vpn-proxy"
 mkdir -p "$client_dir/backups"
+# Files may contain proxy credentials. Never expose them to other local users.
+chmod 0700 "$client_dir" "$client_dir/backups"
 backup_dir=$(mktemp -d "$client_dir/backups/$(date +%Y%m%d-%H%M%S).XXXXXX")
 for file in "$client_dir/env.sh" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login"; do
     [[ ! -f "$file" ]] || cp -p "$file" "$backup_dir/$(basename "$file")"
@@ -66,7 +68,7 @@ export no_proxy
 export NO_PROXY="$no_proxy"
 RK_VPN_ENVIRONMENT
 } > "$temporary_env"
-chmod 0644 "$temporary_env"
+chmod 0600 "$temporary_env"
 mv -- "$temporary_env" "$client_dir/env.sh"
 trap - EXIT
 startup_files=(.bashrc .profile)

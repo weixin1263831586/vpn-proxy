@@ -122,7 +122,7 @@ Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](script
 | `test_url` | 客户端安装时验证的 HTTPS 地址 |
 | `no_proxy` | 合并进客户端 `no_proxy` 的默认条目 |
 
-当前默认白名单为 RFC1918 内网：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`。可根据实际网络收窄或指定其他授权网段。
+当前默认白名单只包含已知编译服务器 `10.10.10.206/32` 和 Windows 客户端 `172.16.14.66/32`，并为这些客户端保留了已知的内网 `no_proxy` 主机。新增客户机或新内网服务时需显式修改 `allowed_clients` 与 `no_proxy`。不要直接放开整个 RFC1918 私网。
 
 ```bash
 cd /path/to/vpn-proxy
@@ -143,7 +143,15 @@ sudo bash install.sh
 
 ### Linux / Bash
 
-在需要代理的机器上，用实际使用的用户打开 Bash，执行：
+推荐先使用 SSH 校验代理服务器主机密钥并获取脚本，避免直接执行明文 HTTP 响应：
+
+```bash
+source <(ssh -o StrictHostKeyChecking=ask proxy_user@172.16.14.233 'cat /usr/local/lib/rk-vpn-proxy/build/client-install.sh')
+```
+
+若只能访问 HTTP 下载服务，应先独立下载并核对脚本内容或可信 SHA-256 哈希，而非直接执行。
+
+作为兼容保留的 HTTP 方式（**不推荐用于正式部署**），在需要代理的机器上用实际使用的用户打开 Bash，执行：
 
 ```bash
 source <(curl --noproxy '*' -fsSL http://172.16.14.233:8089/install.sh)
@@ -182,7 +190,7 @@ source <(ssh -o StrictHostKeyChecking=ask proxy_user@172.16.14.233 'cat /usr/loc
 
 ### Windows / PowerShell
 
-Windows 直接使用同一台 Ubuntu 主机的 HTTP 代理，无需在 Windows 安装 Squid 或公司 VPN 客户端。客户端需要能连接代理和下载端口，并在来源网段白名单内。
+Windows 直接使用同一台 Ubuntu 主机的 HTTP 代理，无需在 Windows 安装 Squid 或公司 VPN 客户端。客户端需要能连接代理端口，并在来源网段白名单内。建议通过受信任的 SSH/SCP 等渠道获取安装脚本；下文保留的 HTTP 下载命令存在内容被篡改风险。
 
 脚本使用 Windows PowerShell 5.1 语法，也可在 PowerShell 7 执行；需要系统提供 `curl.exe`。普通用户权限即可配置当前用户。
 
