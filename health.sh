@@ -19,7 +19,7 @@ if ! ip -4 route get 8.8.8.8 | grep -q 'dev ppp0'; then
     exit 0
 fi
 if ! exit_ip=$(curl --silent --show-error --fail --noproxy '' \
-    --proxy http://127.0.0.1:17897 --connect-timeout 5 --max-time 20 \
+    --proxy http://127.0.0.1:17897 --connect-timeout 15 --max-time 30 \
     https://api.ipify.org); then
     log_change 'VPN PROBE FAILED: HTTPS request through the proxy failed.'
     exit 0

@@ -14,7 +14,8 @@ proxy=http://172.16.14.233:7897
 echo "Checking proxy: $proxy"
 # A failed probe leaves the current persistent settings untouched.
 probe=$(curl --silent --show-error --fail --noproxy '' --proxy "$proxy" \
-    --connect-timeout 5 --max-time 30 --head --output /dev/null \
+    --connect-timeout 20 --max-time 45 --retry 2 --retry-delay 2 \
+    --retry-max-time 90 --retry-connrefused --head --output /dev/null \
     --write-out '%{http_connect} %{http_code}' https://www.google.com)
 [[ "$probe" == '200 200' ]] || {
     printf 'Google proxy check failed: %s\n' "$probe" >&2
@@ -74,7 +75,8 @@ RK_VPN_INSTALL_BODY
         source "$HOME/.config/rk-vpn-proxy/env.sh" || return
         unset -f _rk_vpn_install
         printf '\nTesting: curl -I https://www.google.com\n'
-        curl -I --connect-timeout 5 --max-time 30 https://www.google.com
+        curl -I --connect-timeout 20 --max-time 45 --retry 2 \
+            --retry-delay 2 --retry-max-time 90 --retry-connrefused https://www.google.com
     else
         unset -f _rk_vpn_install
         echo 'Installation failed; check proxy connectivity and the error above.' >&2
