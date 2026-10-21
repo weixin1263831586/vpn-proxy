@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN-only egress firewall for the build server proxy
+After=network-pre.target nftables.service ufw.service
+Before=rk-vpn-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/rk-vpn-proxy-firewall
+RemainAfterExit=yes
+# Keep the rules installed even when this unit is stopped.
+
+[Install]
+WantedBy=multi-user.target

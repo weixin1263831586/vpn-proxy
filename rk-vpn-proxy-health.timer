@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor the VPN proxy every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

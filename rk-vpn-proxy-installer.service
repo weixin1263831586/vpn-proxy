@@ -1,0 +1,17 @@
+[Unit]
+Description=Build server VPN proxy installer download
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/hcq/vpn-proxy/serve-installer.py
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

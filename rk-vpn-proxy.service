@@ -1,0 +1,31 @@
+[Unit]
+Description=Build server HTTP proxy through the company VPN
+Wants=network-online.target
+After=network-online.target rk-vpn-proxy-firewall.service
+BindsTo=rk-vpn-proxy-firewall.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=rk-vpn-proxy
+Group=rk-vpn-proxy
+RuntimeDirectory=rk-vpn-proxy
+RuntimeDirectoryMode=0750
+LogsDirectory=rk-vpn-proxy
+LogsDirectoryMode=0750
+ExecStartPre=/usr/sbin/squid -k parse -f /etc/rk-vpn-proxy/squid.conf
+ExecStart=/usr/sbin/squid -N -f /etc/rk-vpn-proxy/squid.conf
+ExecReload=/usr/sbin/squid -k reconfigure -f /etc/rk-vpn-proxy/squid.conf
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+LimitNOFILE=65536
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
