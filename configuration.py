@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 def load_config(path=None):
     path = path or os.environ.get("RK_VPN_PROXY_CONFIG") or Path(__file__).with_name("config.json")
-    config = json.loads(Path(path).read_text())
+    config = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     ipaddress.IPv4Address(config["listen_host"])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", config["advertise_host"]):
         raise ValueError("advertise_host must be an IPv4 address or hostname")

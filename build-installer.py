@@ -9,14 +9,21 @@ ROOT = Path(__file__).resolve().parent
 
 
 def render(config):
-    installer = (ROOT / "templates/client-install.sh.in").read_text()
+    installer = (ROOT / "templates/client-install.sh.in").read_text(encoding="utf-8")
+    windows_installer = (ROOT / "templates/client-install.ps1.in").read_text(encoding="utf-8")
+    for key, value in {
+        "PROXY_URL": proxy_url(config),
+        "TEST_URL": config["test_url"],
+        "NO_PROXY": ",".join(config["no_proxy"]),
+    }.items():
+        windows_installer = windows_installer.replace("@@" + key + "@@", "'" + value.replace("'", "''") + "'")
     for key, value in {
         "PROXY_URL": shlex.quote(proxy_url(config)),
         "TEST_URL": shlex.quote(config["test_url"]),
         "NO_PROXY": shlex.quote(",".join(config["no_proxy"])),
     }.items():
         installer = installer.replace("@@" + key + "@@", value)
-    squid = (ROOT / "templates/squid.conf.in").read_text()
+    squid = (ROOT / "templates/squid.conf.in").read_text(encoding="utf-8")
     for key in ("listen_host", "proxy_port", "health_port", "allowed_clients", "dns_nameservers"):
         value = config[key]
         if isinstance(value, list):
@@ -32,7 +39,8 @@ def render(config):
         "PROXY_TEST_URL": config["test_url"],
     }
     runtime_text = "".join(f"{key}={shlex.quote(str(value))}\n" for key, value in runtime.items())
-    return {"client-install.sh": installer, "squid.conf": squid, "runtime.env": runtime_text}
+    return {"client-install.sh": installer, "client-install.ps1": windows_installer,
+            "squid.conf": squid, "runtime.env": runtime_text}
 
 
 def main():
@@ -45,7 +53,7 @@ def main():
     for name, content in outputs.items():
         destination = args.output_dir / name
         temporary = destination.with_suffix(destination.suffix + ".tmp")
-        temporary.write_text(content)
+        temporary.write_text(content, encoding="utf-8")
         temporary.replace(destination)
 
 

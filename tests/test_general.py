@@ -35,11 +35,20 @@ class GeneralDeploymentTests(unittest.TestCase):
         self.assertIn("http_port 192.168.50.1:8765", outputs["squid.conf"])
         self.assertIn("acl allowed_clients src 192.168.50.0/24", outputs["squid.conf"])
         self.assertIn("http://vpn.example.test:8765", outputs["client-install.sh"])
+        self.assertIn("http://vpn.example.test:8765", outputs["client-install.ps1"])
         self.assertIn("VPN_INTERFACE=tun8", outputs["runtime.env"])
         for content in outputs.values():
             self.assertNotIn("10.10.10.206", content)
             self.assertNotIn("172.16.14.233", content)
             self.assertNotIn("@@", content)
+
+    def test_windows_literals_escape_single_quotes(self):
+        config = load_config()
+        config["test_url"] = "https://example.test/it's-here"
+        config["no_proxy"] = ["one'entry.internal"]
+        output = BUILDER.render(config)["client-install.ps1"]
+        self.assertIn("'https://example.test/it''s-here'", output)
+        self.assertIn("'one''entry.internal'", output)
 
     def test_invalid_config_fails_before_rendering(self):
         for updates in ({"proxy_port": 70000}, {"allowed_clients": ["invalid"]},

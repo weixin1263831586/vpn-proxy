@@ -21,3 +21,16 @@ jobs:
           bash -n build/client-install.sh
           python3 build-installer.py --output-dir "$RUNNER_TEMP/vpn-proxy-build"
           diff -ru build "$RUNNER_TEMP/vpn-proxy-build"
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate Windows installer
+        run: python build-installer.py
+      - name: Windows PowerShell 5.1 regression
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/test-windows.ps1
+      - name: PowerShell 7 regression
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/test-windows.ps1

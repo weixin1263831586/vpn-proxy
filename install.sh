@@ -59,7 +59,7 @@ install -m 0755 "$source_dir/scripts/firewall.sh" /usr/local/libexec/rk-vpn-prox
 install -m 0755 "$source_dir/scripts/health.sh" /usr/local/libexec/rk-vpn-proxy-health
 install -d -m 0755 /usr/local/lib/rk-vpn-proxy/build
 install -m 0644 "$source_dir/serve-installer.py" "$source_dir/configuration.py" /usr/local/lib/rk-vpn-proxy/
-install -m 0644 "$build_dir/client-install.sh" /usr/local/lib/rk-vpn-proxy/build/client-install.sh
+install -m 0644 "$build_dir/client-install.sh" "$build_dir/client-install.ps1" /usr/local/lib/rk-vpn-proxy/build/
 for name in rk-vpn-proxy-firewall.service rk-vpn-proxy.service rk-vpn-proxy-health.service rk-vpn-proxy-health.timer rk-vpn-proxy-installer.service; do
     install -m 0644 "$source_dir/systemd/$name" "/etc/systemd/system/$name"
 done

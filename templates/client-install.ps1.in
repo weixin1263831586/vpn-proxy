@@ -1,0 +1,171 @@
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [string]$ProxyUrl = @@PROXY_URL@@,
+    [string]$TestUrl = @@TEST_URL@@,
+    [string]$NoProxy = @@NO_PROXY@@,
+    [switch]$SystemProxy,
+    [switch]$Uninstall
+)
+
+$ErrorActionPreference = 'Stop'
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    throw 'This installer requires Windows. Use install.sh on Linux.'
+}
+$stateDirectory = Join-Path $env:LOCALAPPDATA 'rk-vpn-proxy'
+$backupPath = Join-Path $stateDirectory 'backup.json'
+$registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+$environmentNames = @('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')
+$registryNames = @('ProxyEnable', 'ProxyServer', 'ProxyOverride', 'AutoConfigURL')
+
+function Notify-RKProxyChange([bool]$ProxyChanged) {
+    if (-not ('RKVPN.Native' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace RKVPN {
+    public static class Native {
+        [DllImport("wininet.dll", SetLastError=true)]
+        public static extern bool InternetSetOption(IntPtr handle, uint option, IntPtr buffer, uint length);
+        [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        public static extern IntPtr SendMessageTimeout(IntPtr handle, uint message, UIntPtr wparam,
+            string lparam, uint flags, uint timeout, out UIntPtr result);
+    }
+}
+'@
+    }
+    if ($ProxyChanged) {
+        [void][RKVPN.Native]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+        [void][RKVPN.Native]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+    }
+    $result = [UIntPtr]::Zero
+    [void][RKVPN.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero,
+        'Environment', 2, 2000, [ref]$result)
+}
+
+function Get-RKRegistryState {
+    $values = [ordered]@{}
+    $key = if (Test-Path $registryPath) { Get-Item $registryPath } else { $null }
+    foreach ($name in $registryNames) {
+        $present = $null -ne $key -and $key.GetValueNames() -contains $name
+        $values[$name] = [ordered]@{
+            Present = $present
+            Kind = if ($present) { $key.GetValueKind($name).ToString() } else { $null }
+            Value = if ($present) {
+                $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            } else { $null }
+        }
+    }
+    return $values
+}
+
+function Save-RKState($State) {
+    [void][IO.Directory]::CreateDirectory($stateDirectory)
+    $temporary = "$backupPath.tmp"
+    $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $backupPath -Force
+}
+
+if ($Uninstall) {
+    if (-not (Test-Path -LiteralPath $backupPath)) { throw "No backup found: $backupPath" }
+    $state = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
+    if ($state.Version -ne 1) { throw 'Unsupported backup format.' }
+    foreach ($name in $environmentNames) {
+        [Environment]::SetEnvironmentVariable($name, $state.Environment.$name.User, 'User')
+        [Environment]::SetEnvironmentVariable($name, $state.Environment.$name.Process, 'Process')
+    }
+    if ($state.SystemProxyChanged) {
+        if (-not (Test-Path $registryPath)) { [void](New-Item -Path $registryPath -Force) }
+        foreach ($name in $registryNames) {
+            $saved = $state.InternetSettings.$name
+            if ($saved.Present) {
+                [void](New-ItemProperty -Path $registryPath -Name $name -Value $saved.Value -PropertyType $saved.Kind -Force)
+            } else {
+                Remove-ItemProperty -Path $registryPath -Name $name -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    Notify-RKProxyChange ([bool]$state.SystemProxyChanged)
+    $archive = Join-Path $stateDirectory ("restored-{0}.json" -f [Guid]::NewGuid().ToString('N'))
+    Move-Item -LiteralPath $backupPath -Destination $archive
+    Write-Host "Original user proxy settings restored. Backup: $archive"
+    return
+}
+
+if (-not $PSBoundParameters.ContainsKey('ProxyUrl') -and $env:RK_VPN_PROXY_URL) { $ProxyUrl = $env:RK_VPN_PROXY_URL }
+if (-not $PSBoundParameters.ContainsKey('TestUrl') -and $env:RK_VPN_TEST_URL) { $TestUrl = $env:RK_VPN_TEST_URL }
+if (-not $PSBoundParameters.ContainsKey('NoProxy') -and $env:RK_VPN_NO_PROXY) { $NoProxy = $env:RK_VPN_NO_PROXY }
+$proxyUri = [Uri]$ProxyUrl
+if (-not $proxyUri.IsAbsoluteUri -or $proxyUri.Scheme -notin @('http', 'https') -or
+    $proxyUri.UserInfo -or $proxyUri.AbsolutePath -ne '/' -or $proxyUri.Query -or $proxyUri.Fragment) {
+    throw 'Expected an HTTP(S) proxy URL without credentials or a path.'
+}
+if (([Uri]$TestUrl).Scheme -ne 'https') { throw 'TestUrl must use HTTPS.' }
+if ($SystemProxy -and $proxyUri.Scheme -ne 'http') { throw 'SystemProxy requires an http:// proxy URL.' }
+[void](Get-Command curl.exe -ErrorAction Stop)
+
+Write-Host "Checking proxy: $ProxyUrl"
+# Empty native-command arguments differ between Windows PowerShell and PS7.
+# Temporarily clear no_proxy instead of passing --noproxy with an empty value.
+$previousNoProxy = [Environment]::GetEnvironmentVariable('no_proxy', 'Process')
+try {
+    [Environment]::SetEnvironmentVariable('no_proxy', $null, 'Process')
+    $metrics = & curl.exe --silent --show-error --fail --proxy $ProxyUrl `
+        --connect-timeout 20 --max-time 45 --retry 2 --retry-delay 2 --retry-max-time 90 `
+        --retry-connrefused --head --output NUL --write-out '%{http_connect} %{http_code} %{ssl_verify_result}' $TestUrl
+    $curlExit = $LASTEXITCODE
+} finally {
+    [Environment]::SetEnvironmentVariable('no_proxy', $previousNoProxy, 'Process')
+}
+if ($curlExit -ne 0 -or "$metrics" -notmatch '^200 [23][0-9][0-9] 0$') {
+    throw "Proxy verification failed (curl=$curlExit, metrics=$metrics); settings were not changed."
+}
+
+if (Test-Path -LiteralPath $backupPath) {
+    $state = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
+    if ($state.Version -ne 1) { throw 'Unsupported backup format.' }
+} else {
+    $originalEnvironment = [ordered]@{}
+    foreach ($name in $environmentNames) {
+        $originalEnvironment[$name] = [ordered]@{
+            User = [Environment]::GetEnvironmentVariable($name, 'User')
+            Process = [Environment]::GetEnvironmentVariable($name, 'Process')
+        }
+    }
+    $state = [pscustomobject]@{ Version = 1; Environment = $originalEnvironment; SystemProxyChanged = $false; InternetSettings = $null }
+}
+if ($SystemProxy -and -not $state.SystemProxyChanged) {
+    $state.InternetSettings = Get-RKRegistryState
+    $state.SystemProxyChanged = $true
+}
+Save-RKState $state
+
+$bypass = [System.Collections.Generic.List[string]]::new()
+$seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$existingNoProxy = if ($previousNoProxy) { $previousNoProxy } else { [Environment]::GetEnvironmentVariable('no_proxy', 'User') }
+foreach ($item in (@($existingNoProxy -split ',') + @($NoProxy -split ',') + @('localhost', '127.0.0.1', '::1', $proxyUri.DnsSafeHost))) {
+    $item = $item.Trim()
+    if ($item -and $seen.Add($item)) { $bypass.Add($item) }
+}
+$settings = @{ http_proxy = $ProxyUrl; https_proxy = $ProxyUrl; no_proxy = ($bypass -join ','); all_proxy = $null }
+foreach ($name in $environmentNames) {
+    [Environment]::SetEnvironmentVariable($name, $settings[$name], 'User')
+    [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
+}
+if ($SystemProxy) {
+    if (-not (Test-Path $registryPath)) { [void](New-Item -Path $registryPath -Force) }
+    $current = Get-Item $registryPath
+    $windowsBypass = @($current.GetValue('ProxyOverride', '') -split ';') + @('<local>') + @($bypass | Where-Object { $_ -notmatch '/' })
+    $windowsBypass = $windowsBypass | Where-Object { $_ } | Select-Object -Unique
+    [void](New-ItemProperty -Path $registryPath -Name ProxyEnable -Value 1 -PropertyType DWord -Force)
+    [void](New-ItemProperty -Path $registryPath -Name ProxyServer -Value $proxyUri.Authority -PropertyType String -Force)
+    [void](New-ItemProperty -Path $registryPath -Name ProxyOverride -Value ($windowsBypass -join ';') -PropertyType String -Force)
+    Remove-ItemProperty -Path $registryPath -Name AutoConfigURL -ErrorAction SilentlyContinue
+}
+Notify-RKProxyChange ([bool]$SystemProxy)
+Write-Host "Installed current-user proxy: $ProxyUrl"
+Write-Host "Backup: $backupPath"
+Write-Host 'New applications inherit the user environment. Restart existing terminals/apps if needed.'
+Write-Host "Testing: curl.exe -I $TestUrl"
+& curl.exe -I --connect-timeout 20 --max-time 45 --retry 2 --retry-delay 2 --retry-max-time 90 --retry-connrefused $TestUrl
+if ($LASTEXITCODE -ne 0) { throw 'Final environment-proxy test failed; use -Uninstall to restore the backup if needed.' }

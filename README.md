@@ -2,7 +2,7 @@
 
 本项目将一台已有 VPN 连接的 Linux 主机作为 HTTP 正向代理出口，让其他机器上的 curl、Git 等应用通过这台主机访问外网。项目负责代理部署、客户端环境配置、VPN 出口限制和健康检查；VPN 连接由主机原有的 VPN 客户端维护。
 
-客户端没有固定 IP 限制，访问权限由服务端配置的来源网段决定。每个 Linux 用户独立安装自己的代理环境。
+客户端没有固定 IP 限制，访问权限由服务端配置的来源网段决定。支持 Linux Bash 和 Windows PowerShell 客户端，每个用户独立安装自己的代理环境。
 
 ## 架构
 
@@ -36,7 +36,8 @@ flowchart LR
 | --- | --- | --- |
 | 应用代理 | `172.16.14.233:7897` | 通过来源 CIDR 白名单控制 |
 | 本机健康检查 | `127.0.0.1:17897` | 仅回环监听 |
-| 安装脚本下载 | `172.16.14.233:8089/install.sh` | 与代理共用来源网段配置 |
+| Linux 安装脚本 | `172.16.14.233:8089/install.sh` | 与代理共用来源网段配置 |
+| Windows 安装脚本 | `172.16.14.233:8089/install.ps1` | 与 Linux 下载共用访问策略 |
 | 外网出口 | `ppp0` | 依赖主机已建立的 VPN 和路由 |
 
 这些是当前部署参数，客户端和服务端程序不校验某一台固定的客户端机器。
@@ -140,6 +141,8 @@ sudo bash install.sh
 
 ## 配置客户端
 
+### Linux / Bash
+
 在需要代理的机器上，用实际使用的用户打开 Bash，执行：
 
 ```bash
@@ -176,6 +179,49 @@ curl -I https://www.google.com
 ```bash
 source <(ssh -o StrictHostKeyChecking=ask proxy_user@172.16.14.233 'cat /usr/local/lib/rk-vpn-proxy/build/client-install.sh')
 ```
+
+### Windows / PowerShell
+
+Windows 直接使用同一台 Ubuntu 主机的 HTTP 代理，无需在 Windows 安装 Squid 或公司 VPN 客户端。客户端需要能连接代理和下载端口，并在来源网段白名单内。
+
+脚本使用 Windows PowerShell 5.1 语法，也可在 PowerShell 7 执行；需要系统提供 `curl.exe`。普通用户权限即可配置当前用户。
+
+如果当前提示符是 `C:\Users\hcq>`，先执行 `powershell -NoProfile`，进入提示符以 `PS` 开头的 PowerShell。然后执行下面两行，包含终端环境及 Windows 用户代理（供遵循系统代理的浏览器/应用使用）：
+
+```powershell
+$proxyScript = curl.exe --noproxy "*" -fsSL http://172.16.14.233:8089/install.ps1
+if ($LASTEXITCODE -ne 0) { throw "Installer download failed" }; & ([scriptblock]::Create(($proxyScript -join "`n"))) -SystemProxy
+```
+
+只需要 curl/Git 等终端工具时去掉 `-SystemProxy`。可以通过 `-ProxyUrl`、`-TestUrl`、`-NoProxy` 覆盖默认参数，也支持与 Bash 一致的 `RK_VPN_*` 环境变量。
+
+安装流程先通过显式代理验证 CONNECT、TLS 及目标的 2xx/3xx 响应。成功后将 `http_proxy`、`https_proxy`、`no_proxy` 写入当前进程及当前用户环境，清除当前用户的 `all_proxy`，最后自动执行 `curl.exe -I` 测试。
+
+Windows 环境变量名不区分大小写。当前 PowerShell 会立即生效；持久配置供新启动的应用继承，已运行的终端、IDE 等可能需要完全退出后重开。Windows PowerShell 5.1 中的 `curl` 可能是命令别名，文档统一使用 `curl.exe`。
+
+`-SystemProxy` 额外配置 HKCU 的 Windows 用户代理，保存并移除当前 PAC URL，通知 WinINet 刷新。它不配置计算机级 WinHTTP 代理，也不转发全系统 TCP/UDP。Windows 绕过列表保留原条目并合并具体地址，`no_proxy` 中的 CIDR 不自动转换成 Windows 绕过规则。
+
+若 Clash Verge 等程序正在接管 Windows 系统代理，应先停止其接管，避免再次覆盖本项目设置。浏览器有独立代理配置或受到策略管理时，需按该应用实际设置处理。
+
+首次修改前的环境变量及所需的 Windows 用户代理设置备份到 `%LOCALAPPDATA%\rk-vpn-proxy\backup.json`。重复安装保留原备份；恢复时执行：
+
+```powershell
+$proxyScript = curl.exe --noproxy "*" -fsSL http://172.16.14.233:8089/install.ps1
+if ($LASTEXITCODE -ne 0) { throw "Installer download failed" }; & ([scriptblock]::Create(($proxyScript -join "`n"))) -Uninstall
+```
+
+恢复后备份归档到同目录的 `restored-*.json`。HTTP 获取代码的信任边界与 Linux 安装方式相同，也可通过 SSH 读取 `/usr/local/lib/rk-vpn-proxy/build/client-install.ps1` 后执行。
+
+接口连通性可以先独立测试：
+
+```powershell
+Test-NetConnection 172.16.14.233 -Port 7897
+curl.exe --proxy http://172.16.14.233:7897 -I https://www.google.com
+```
+
+原生 Windows 的注册表、变量持久化与恢复测试位于 `tests/test-windows.ps1`；CI 分别用 Windows PowerShell 5.1 和 PowerShell 7 执行。本地 Linux 上的 PowerShell 检查仅验证脚本语法，不能替代 Windows 实机验证。
+
+参考：[Microsoft 环境变量说明](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_environment_variables)、[Windows curl 说明](https://learn.microsoft.com/windows/curl/)、[WinINet Internet 选项](https://learn.microsoft.com/en-us/windows/win32/wininet/setting-and-retrieving-internet-options)。
 
 ## 运行维护
 
@@ -245,7 +291,7 @@ vpn-proxy/
 ├── configuration.py             # 共享配置校验
 ├── build-installer.py           # 生成部署文件
 ├── serve-installer.py           # 安装脚本下载服务
-├── templates/                   # 客户端安装器、Squid 配置模板
+├── templates/                   # Bash / PowerShell 安装器、Squid 配置模板
 ├── scripts/                     # 防火墙与健康检查脚本
 ├── systemd/                     # 4 个服务单元和 1 个定时器
 ├── tests/                       # Python 回归测试及隔离网络测试
@@ -258,5 +304,5 @@ vpn-proxy/
 - `configuration.py` 同时被生成器、下载服务及诊断工具使用，保留为共享模块。
 - 客户端安装流程与环境配置放在一个模板中，便于维护完整的安装行为。
 - 防火墙、代理、健康检查和下载服务有独立的账户、依赖和启停方式，systemd 单元分别维护；定时器只负责调度。
-- `build/` 中的 `client-install.sh`、`squid.conf` 和 `runtime.env` 都是生成物，可以删除后重新运行 `python3 build-installer.py` 生成。已部署服务使用系统目录中的副本，不依赖源码下的生成目录。
+- `build/` 中的 `client-install.sh`、`client-install.ps1`、`squid.conf` 和 `runtime.env` 都是生成物，可以删除后重新运行 `python3 build-installer.py` 生成。已部署服务使用系统目录中的副本，不依赖源码下的生成目录。
 - 运行日志、安装包、Python 缓存和人工验证记录不属于源码；运行日志由系统日志目录管理，历史审核材料可在项目外归档。
