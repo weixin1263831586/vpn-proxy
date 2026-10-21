@@ -23,6 +23,17 @@ def load_config(path=None):
     networks = [ipaddress.ip_network(value, strict=False) for value in config["allowed_clients"]]
     if not networks:
         raise ValueError("Configure at least one allowed client network")
+    if type(config.get("allow_public_clients", False)) is not bool:
+        raise ValueError("allow_public_clients must be a boolean")
+    private_ranges = [ipaddress.ip_network(value) for value in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")]
+    for network in networks:
+        if network.prefixlen == 0:
+            raise ValueError("Unrestricted client networks are forbidden")
+        if not config.get("allow_public_clients", False) and not any(
+                network.version == private.version and network.subnet_of(private)
+                for private in private_ranges):
+            raise ValueError("Public client networks require allow_public_clients=true")
     config["allowed_clients"] = [str(network) for network in networks]
     for address in config["dns_nameservers"]:
         ipaddress.IPv4Address(address)

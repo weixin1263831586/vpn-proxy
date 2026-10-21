@@ -52,7 +52,10 @@ class GeneralDeploymentTests(unittest.TestCase):
 
     def test_invalid_config_fails_before_rendering(self):
         for updates in ({"proxy_port": 70000}, {"allowed_clients": ["invalid"]},
-                        {"vpn_interface": 'tun0"; reject'}, {"proxy_port": 8089}):
+                        {"vpn_interface": 'tun0"; reject'}, {"proxy_port": 8089},
+                        {"allowed_clients": ["0.0.0.0/0"], "allow_public_clients": True},
+                        {"allowed_clients": ["::/0"]}, {"allowed_clients": ["8.8.8.8/32"]},
+                        {"allow_public_clients": "true"}):
             config = copy.deepcopy(load_config())
             config.update(updates)
             with tempfile.TemporaryDirectory() as directory:
@@ -60,6 +63,14 @@ class GeneralDeploymentTests(unittest.TestCase):
                 path.write_text(json.dumps(config))
                 with self.assertRaises(ValueError):
                     load_config(path)
+
+    def test_public_clients_need_explicit_opt_in(self):
+        config = load_config()
+        config.update(allowed_clients=["8.8.8.8/32"], allow_public_clients=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config))
+            self.assertEqual(load_config(path)["allowed_clients"], ["8.8.8.8/32"])
 
     def test_installer_arbitrary_user_home_override_and_idempotency(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,6 +97,14 @@ class GeneralDeploymentTests(unittest.TestCase):
                 for filename in (".bashrc", ".profile", ".bash_profile"):
                     self.assertEqual((home / filename).read_text().count("# rk-vpn-proxy environment"), 1)
                 self.assertEqual(len(list((home / ".config/rk-vpn-proxy/backups").iterdir())), 2)
+                client_dir = home / ".config/rk-vpn-proxy"
+                self.assertEqual(client_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((client_dir / "env.sh").stat().st_mode & 0o777, 0o600)
+                # A POSIX login shell must not evaluate the Bash environment body.
+                posix = subprocess.run(["dash", "-c", '. "$HOME/.profile"'],
+                                       env=env, capture_output=True, text=True)
+                self.assertEqual(posix.returncode, 0, posix.stderr)
+                self.assertEqual(posix.stderr, "")
 
 
 if __name__ == "__main__":

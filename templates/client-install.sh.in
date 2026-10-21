@@ -12,6 +12,7 @@ _rk_vpn_install() {
     if RK_VPN_INSTALL_PROXY="$proxy" RK_VPN_INSTALL_TEST_URL="$test_url" \
         RK_VPN_INSTALL_NO_PROXY="$extra_no_proxy" bash <<'RK_VPN_INSTALL_BODY'
 set -euo pipefail
+umask 077
 command -v curl >/dev/null
 proxy=$RK_VPN_INSTALL_PROXY
 echo "Checking proxy: $proxy"
@@ -27,6 +28,9 @@ read -r connect_status http_status <<< "$probe"
 }
 client_dir="$HOME/.config/rk-vpn-proxy"
 mkdir -p "$client_dir/backups"
+chmod 0700 "$client_dir" "$client_dir/backups"
+# Restrict backups from earlier installations as well.
+chmod -R go-rwx "$client_dir/backups"
 backup_dir=$(mktemp -d "$client_dir/backups/$(date +%Y%m%d-%H%M%S).XXXXXX")
 for file in "$client_dir/env.sh" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login"; do
     [[ ! -f "$file" ]] || cp -p "$file" "$backup_dir/$(basename "$file")"
@@ -34,6 +38,7 @@ done
 temporary_env=$(mktemp "$client_dir/.env.XXXXXX")
 trap 'rm -- "$temporary_env" 2>/dev/null || true' EXIT
 {
+    printf '%s\n' '[ -n "${BASH_VERSION:-}" ] || return 0'
     printf '_rk_vpn_proxy_url=%q\n' "$proxy"
     printf '_rk_vpn_extra_no_proxy=%q\n' "$RK_VPN_INSTALL_NO_PROXY"
     cat <<'RK_VPN_ENVIRONMENT'
@@ -66,7 +71,7 @@ export no_proxy
 export NO_PROXY="$no_proxy"
 RK_VPN_ENVIRONMENT
 } > "$temporary_env"
-chmod 0644 "$temporary_env"
+chmod 0600 "$temporary_env"
 mv -- "$temporary_env" "$client_dir/env.sh"
 trap - EXIT
 startup_files=(.bashrc .profile)

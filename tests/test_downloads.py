@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+import logging
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, build_opener
@@ -34,6 +35,17 @@ class InstallerDownloads(unittest.TestCase):
                     with self.assertRaises(HTTPError) as denied_path:
                         opener.open(f"{base}/../config.json")
                     self.assertEqual(denied_path.exception.code, 404)
+                    for failure in (ValueError("broken config"), OSError("unreadable config")):
+                        with patch.object(DOWNLOADER, "load_config", side_effect=failure), \
+                             self.assertLogs(level=logging.ERROR):
+                            with self.assertRaises(HTTPError) as unavailable:
+                                opener.open(f"{base}/install.sh")
+                            self.assertEqual(unavailable.exception.code, 503)
+                    (build / "client-install.ps1").unlink()
+                    with self.assertLogs(level=logging.ERROR):
+                        with self.assertRaises(HTTPError) as missing_file:
+                            opener.open(f"{base}/install.ps1")
+                    self.assertEqual(missing_file.exception.code, 503)
                     with patch.object(DOWNLOADER, "client_allowed", return_value=False):
                         for extension in ("sh", "ps1"):
                             with self.assertRaises(HTTPError) as denied_client:

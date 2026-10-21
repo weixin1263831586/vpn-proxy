@@ -1,6 +1,20 @@
 #!/bin/bash
 set -euo pipefail
-source /etc/rk-vpn-proxy/runtime.env
+source "${RK_VPN_RUNTIME:-/etc/rk-vpn-proxy/runtime.env}"
+state_dir=${RK_VPN_FIREWALL_STATE:-/run/rk-vpn-proxy-firewall}
+mode=${1:---apply}
+current_rules() { nft --stateless --numeric list table inet rk_vpn_proxy; }
+check_rules() {
+    local actual expected
+    expected=$(cat "$state_dir/expected.nft") || return 1
+    actual=$(current_rules 2>/dev/null) || return 1
+    [[ -n "$expected" && "$actual" == "$expected" ]]
+}
+if [[ "$mode" == --check ]]; then
+    check_rules
+    exit
+fi
+[[ "$mode" == --apply || "$mode" == --watch || "$mode" == --validate ]] || { echo 'Use --apply, --watch, --check or --validate.' >&2; exit 2; }
 proxy_uid=$(id -u rk-vpn-proxy)
 rules=$(mktemp)
 trap 'rm -f "$rules"' EXIT
@@ -24,4 +38,26 @@ table inet rk_vpn_proxy {
 }
 EOF
 nft --check --file "$rules"
+[[ "$mode" != --validate ]] || exit 0
 nft --file "$rules"
+if [[ "$mode" == --watch ]]; then
+    install -d -m 0755 "$state_dir"
+    current_rules > "$state_dir/expected.nft"
+    chmod 0644 "$state_dir/expected.nft"
+    cleanup_watch() { rm -f "$state_dir/enforced" "$state_dir/.enforced.tmp"; }
+    mark_enforced() {
+        date +%s > "$state_dir/.enforced.tmp"
+        mv -f "$state_dir/.enforced.tmp" "$state_dir/enforced"
+    }
+    trap 'cleanup_watch; rm -f "$rules"' EXIT
+    trap 'exit 0' TERM INT
+    mark_enforced
+    [[ -z ${NOTIFY_SOCKET:-} ]] || systemd-notify --ready
+    while sleep 1; do
+        if ! check_rules; then
+            echo 'FIREWALL_ENFORCED=0: proxy firewall missing or changed; stopping protected proxy.' >&2
+            exit 1
+        fi
+        mark_enforced
+    done
+fi

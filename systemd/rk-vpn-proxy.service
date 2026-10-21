@@ -13,6 +13,7 @@ RuntimeDirectory=rk-vpn-proxy
 RuntimeDirectoryMode=0750
 LogsDirectory=rk-vpn-proxy
 LogsDirectoryMode=0750
+ExecStartPre=+/usr/local/libexec/rk-vpn-proxy-firewall --check
 ExecStartPre=/usr/sbin/squid -k parse -f /etc/rk-vpn-proxy/squid.conf
 ExecStart=/usr/sbin/squid -N -f /etc/rk-vpn-proxy/squid.conf
 ExecReload=/usr/sbin/squid -k reconfigure -f /etc/rk-vpn-proxy/squid.conf

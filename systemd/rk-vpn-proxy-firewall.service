@@ -4,9 +4,20 @@ After=network-pre.target nftables.service ufw.service
 Before=rk-vpn-proxy.service
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/libexec/rk-vpn-proxy-firewall
-RemainAfterExit=yes
+Type=notify
+NotifyAccess=all
+RuntimeDirectory=rk-vpn-proxy-firewall
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/libexec/rk-vpn-proxy-firewall --watch
+ExecStopPost=/usr/bin/rm -f /run/rk-vpn-proxy-firewall/enforced
+TimeoutStartSec=15s
+TimeoutStopSec=5s
+Restart=no
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
 # Keep the rules installed even when this unit is stopped.
 
 [Install]

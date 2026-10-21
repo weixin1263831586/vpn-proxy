@@ -1,7 +1,6 @@
 [Unit]
 Description=Check VPN proxy connectivity and report exit IP changes
 After=rk-vpn-proxy.service
-Requires=rk-vpn-proxy.service
 
 [Service]
 Type=oneshot
