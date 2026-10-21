@@ -1,113 +1,262 @@
-# 编译服务器 VPN HTTP 代理
+# VPN HTTP 代理
 
-目标路径：`10.10.10.206 → 172.16.14.233:7897 → ppp0 → 互联网`。
+本项目将一台已有 VPN 连接的 Linux 主机作为 HTTP 正向代理出口，让其他机器上的 curl、Git 等应用通过这台主机访问外网。项目负责代理部署、客户端环境配置、VPN 出口限制和健康检查；VPN 连接由主机原有的 VPN 客户端维护。
 
-## 一键安装
+客户端没有固定 IP 限制，访问权限由服务端配置的来源网段决定。每个 Linux 用户独立安装自己的代理环境。
 
-在编译服务器 `10.10.10.206` 的 Bash 终端执行：
+## 架构
+
+```mermaid
+flowchart LR
+    subgraph Client[客户端主机]
+        Env[用户代理环境变量]
+        App[curl / Git / 支持代理的应用]
+        Env --> App
+    end
+    subgraph Host[已有 VPN 的代理主机]
+        Download[安装脚本下载服务]
+        Squid[Squid HTTP 正向代理]
+        Guard[nftables 按代理 UID 限制出站]
+        VPN[已建立的 VPN 接口]
+        Timer[systemd 健康检查定时器]
+        Health[本机回环代理监听]
+        State[状态文件与 journal]
+        Download -. 安装当前用户环境 .-> Env
+        Squid --> Guard --> VPN
+        Timer --> Health --> Squid
+        Timer --> State
+    end
+    App -->|HTTP 请求 / HTTPS CONNECT| Squid
+    VPN --> Internet[外部 HTTP / HTTPS 服务]
+```
+
+当前仓库配置的监听如下，均由 `config.json` 生成或读取：
+
+| 用途 | 当前地址 | 访问方式 |
+| --- | --- | --- |
+| 应用代理 | `172.16.14.233:7897` | 通过来源 CIDR 白名单控制 |
+| 本机健康检查 | `127.0.0.1:17897` | 仅回环监听 |
+| 安装脚本下载 | `172.16.14.233:8089/install.sh` | 与代理共用来源网段配置 |
+| 外网出口 | `ppp0` | 依赖主机已建立的 VPN 和路由 |
+
+这些是当前部署参数，客户端和服务端程序不校验某一台固定的客户端机器。
+
+## 工作原理
+
+### 应用如何使用代理
+
+客户端安装器写入 `http_proxy`、`https_proxy` 及对应的大写变量，并清除 `all_proxy` / `ALL_PROXY`。支持这些变量的应用随后连接 Squid。
+
+HTTP 请求由 Squid 转发。HTTPS 请求先向 Squid 发送 CONNECT，建立到目标 443 端口的 TCP 隧道，再由客户端与目标站点进行 TLS 握手。项目没有配置 TLS 解密或证书替换，因此 `https_proxy` 仍使用 `http://代理地址:端口`。
+
+`no_proxy` 用于让指定地址绕过代理。安装器保留用户已有条目，加入本机回环地址、所选代理主机，以及配置或参数指定的条目。
+
+此方式只影响使用该代理的应用。脚本不修改客户端默认路由，也不部署系统级流量转发或 NAT；已运行的子进程、其他用户及独立 systemd 任务不会自动继承当前用户的新环境。
+
+### 代理访问控制与 DNS
+
+Squid 只允许 `allowed_clients` 中的来源网段，以及本机回环健康检查。目标端口限于 80、443，CONNECT 仅允许 443；访问回环、私网、链路本地等配置列出的目标地址会被拒绝。
+
+Squid 直接向 `dns_nameservers` 指定的 DNS 服务器查询。DNS 请求由代理进程发出，也受 VPN 出口规则约束，不通过主机的本地 DNS stub 转发。
+
+代码关闭磁盘缓存，保留访问和运行日志。
+
+### VPN 断线保护
+
+Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](scripts/firewall.sh) 创建专用 `inet rk_vpn_proxy` 表，只匹配这个用户的出站流量，依次放行：
+
+1. 从代理监听端口返回客户端的连接回复。
+2. Squid 在回环接口上的本机 UDP 进程通信。
+3. 经 `vpn_interface` 指定接口发出的流量，包括 DNS。
+
+其余出站流量被拒绝。专用规则存在时，即使 VPN 掉线后系统改用普通网卡，代理也不能借用该出口。VPN 接口及正确路由恢复后，新请求可恢复；已经断开的下载仍需客户端重试。
+
+`rk-vpn-proxy.service` 在防火墙服务之后启动，并通过 `BindsTo` 关联该服务。防火墙加载使用单次 nftables 事务，不清空其他表；停止防火墙单元本身也不会删除已加载规则。
+
+### 配置生成与健康检查
+
+[configuration.py](configuration.py) 校验配置，[build-installer.py](build-installer.py) 生成独立客户端安装脚本、Squid 配置及运行参数文件。生成文件位于 `build/`。部署后的配置位于 `/etc/rk-vpn-proxy/`，下载程序及脚本副本位于 `/usr/local/lib/rk-vpn-proxy/`，下载服务从已部署配置读取访问白名单。
+
+健康检查由 `rk-vpn-health` 用户运行，定时器开机约 45 秒后首次触发，此后约每 60 秒执行一次。它检查 VPN 接口 IPv4 地址、到第一个配置 DNS 地址的路由，并通过回环代理访问 `https://api.ipify.org`。
+
+检查失败返回非零退出码；状态变化和出口 IP 变化写入 journal。状态文件保存在 `/var/lib/rk-vpn-proxy/status` 和 `/var/lib/rk-vpn-proxy/exit-ip`。健康检查负责探测和记录，不控制 VPN 重连。
+
+## 优点与限制
+
+| 优点 | 对应实现 |
+| --- | --- |
+| 适用于多台客户端、多个用户 | 客户端安装按当前 `HOME` 写入，权限按服务端 CIDR 控制 |
+| 应用接入方便 | 使用常见 HTTP 代理环境变量，支持 HTTPS CONNECT |
+| 出口限制范围明确 | nftables 只对 `rk-vpn-proxy` 用户增加出站限制 |
+| VPN 中断时阻止普通网络回退 | 按实际出站接口放行，其他出口拒绝 |
+| 部署参数集中管理 | 配置校验后生成代理、客户端和防火墙运行参数 |
+| 可运维和验证 | systemd 服务、日志轮转、状态探测、配置备份与隔离网络测试 |
+
+实际使用中需要考虑以下限制：
+
+- 支持范围是 HTTP/HTTPS 应用代理，不提供全系统隧道、UDP 代理或任意端口的 TCP 转发；部分应用需要另行设置代理。
+- 代理主机和 VPN 是共同依赖。代码不建立 VPN、不实现 VPN 自动重连，也没有多代理节点切换功能。
+- 安装包含公网连通性检查；公网暂时不可用时可能返回失败，此时部分服务可能已经创建或启动。
+- 访问控制基于来源 IP/CIDR，没有账号密码认证；安装脚本下载服务使用 HTTP，没有配置 HTTPS、签名校验或下载令牌。HTTP 下载链路不能校验脚本真实性，可信传输可使用下文 SSH 方式。
+- 防火墙服务为一次性加载。外部程序清空专用规则后，需要重新加载规则；健康检查不检查 nftables 规则完整性。
+- 服务端监听、DNS 配置和健康路由探测按 IPv4 实现，没有完整的 IPv6 部署流程。
+- 健康检查依赖公网探测服务，只记录状态和 IP 变化，不发送外部告警。项目未提供带宽限额、连接配额或性能保证。
+
+## 部署服务端
+
+适用于提供 apt、systemd 和 nftables 的 Ubuntu 环境。主机需已建立 VPN，具备到客户端的回程路由，并能经 VPN 访问外网。运行脚本前应具备 Bash、Python 3、curl、iproute2 和 sudo/root 权限；隔离网络测试还使用 util-linux 的命名空间工具。
+
+项目可放在任意目录。先编辑 [config.json](config.json)：
+
+| 字段 | 含义 |
+| --- | --- |
+| `listen_host` | 本机 IPv4 监听地址 |
+| `advertise_host` | 客户端连接的代理 IPv4 地址或 DNS 名称 |
+| `proxy_port` | HTTP 代理端口 |
+| `health_port` | 回环健康检查端口 |
+| `installer_port` | 安装脚本下载端口 |
+| `vpn_interface` | 允许代理使用的 VPN 出站接口 |
+| `allowed_clients` | 允许访问代理及下载服务的来源 CIDR 列表 |
+| `dns_nameservers` | Squid 使用的 IPv4 DNS 服务器 |
+| `test_url` | 客户端安装时验证的 HTTPS 地址 |
+| `no_proxy` | 合并进客户端 `no_proxy` 的默认条目 |
+
+当前默认白名单为 RFC1918 内网：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`。可根据实际网络收窄或指定其他授权网段。
+
+```bash
+cd /path/to/vpn-proxy
+sudo bash install.sh
+```
+
+安装器检查发行版 `squid.service` 是否正在运行；发现已有服务时退出，由管理员先处理迁移。Squid 和 nftables 分别检查并按需安装。创建代理、健康检查和下载服务的独立系统账户后，安装器备份配置、校验 Squid 配置、加载防火墙、启动代理、下载服务及监控，并执行连通性检查。启用 UFW 时，为配置中的来源网段增加代理和下载端口规则。
+
+修改项目配置或程序后重新部署，安装器会更新运行副本和相关服务：
+
+```bash
+sudo bash install.sh
+```
+
+也支持 `sudo bash install.sh /path/to/config.json`。应修改配置源文件后重新部署，不直接修改 `build/` 下的生成文件。下载服务以 `rk-vpn-installer` 用户运行，程序路径固定在 `/usr/local/lib/rk-vpn-proxy/`，不依赖部署者的用户名、家目录或源码位置。
+
+## 配置客户端
+
+在需要代理的机器上，用实际使用的用户打开 Bash，执行：
 
 ```bash
 source <(curl --noproxy '*' -fsSL http://172.16.14.233:8089/install.sh)
 ```
 
-脚本会先检查新代理连通性，备份旧配置，安装当前用户的代理环境，加载到当前终端，
-并自动执行 `curl -I https://www.google.com`（附带连接及总超时）。新终端也会自动生效。
-下载时绕过旧代理。重复执行不会重复添加启动配置。
-安装探测和最后的 Google 测试使用 20 秒连接超时、45 秒单次总超时，遇到超时等临时错误最多重试 2 次。
-配置按当前用户安装；例如 `hcq` 已配置并不会自动修改 `hjf` 的环境。
-如使用 `curl ... | bash`，环境仅在安装子进程和后续新终端生效，当前终端需另行 source 环境文件。
+该命令中的主机和端口应与实际下载服务一致。安装器先验证代理的 CONNECT 隧道和目标 HTTPS 响应，成功后备份该用户配置，写入环境文件并加载，最后执行 Google HEAD 测试。连接超时为 20 秒，单次请求最长 45 秒，临时错误最多重试 2 次。
 
-## 部署结果（2026-10-21）
-
-两端已完成部署。编译服务器 `hcq` 用户的新登录及交互式 Bash 均自动加载
-`~/.config/rk-vpn-proxy/env.sh`，原启动文件备份在
-`~/.config/rk-vpn-proxy/backups/` 下的时间戳目录。
-
-代理端口已由 3128 迁移至 7897；一键安装已在实际服务器及独立测试 HOME 中验证，
-包括首次安装、重复安装、当前终端和新登录/交互式终端加载。
-
-已从编译服务器验证 Google、Android 下载服务、Android 源码站和 GitHub 的 HTTPS 隧道及证书；
-通过代理执行 Android manifest 和 GitHub Git 仓库的 `git ls-remote` 均成功。
-实际公网出口为 `103.197.30.140`。
-本机隔离网络测试已验证 VPN 掉线阻断及恢复，未断开真实 VPN。
-
-已经打开的编译终端执行 `. ~/.config/rk-vpn-proxy/env.sh` 后生效。
-
-## 本机服务
-
-Squid 使用独立用户 `rk-vpn-proxy`，配置位于 `/etc/rk-vpn-proxy/squid.conf`。
-仅监听 `172.16.14.233:7897` 和用于本机健康检查的 `127.0.0.1:17897`。
-`127.0.0.1:7897` 已有其他程序，保留该程序的监听。
-内网监听只允许 `10.10.10.206`；私网目标和 80/443 以外的端口会被拒绝。
-
-独立 nftables 表 `inet rk_vpn_proxy` 只限制代理用户的出站流量：
-允许向客户端回复、Squid 本机 UDP IPC，以及经 `ppp0` 的请求；其他出站流量全部拒绝。
-DNS 直接发送给 `8.8.8.8` / `1.1.1.1`，同样受 VPN 出口限制。
-VPN 掉线后不能借用普通网卡出口，恢复 `ppp0` 及其路由后自动恢复新请求。
-VPN 客户端自身的重连由原有 VPN 连接配置负责。
-
-每分钟检查一次实际 HTTPS 出口，VPN 状态及公网 IP 变化写入 systemd journal。
+需要覆盖代理地址时，传入第一个参数：
 
 ```bash
-systemctl status rk-vpn-proxy.service
+source <(curl --noproxy '*' -fsSL http://172.16.14.233:8089/install.sh) http://proxy.example.internal:7897
+```
+
+也支持 `RK_VPN_PROXY_URL`、`RK_VPN_TEST_URL`、`RK_VPN_NO_PROXY`。例如指定额外的内网绕过地址：
+
+```bash
+RK_VPN_NO_PROXY=git.internal,redmine.internal source <(curl --noproxy '*' -fsSL http://172.16.14.233:8089/install.sh)
+```
+
+HTTPS 代理探测要求 CONNECT 成功且目标返回 2xx 或 3xx。探测失败不会覆盖持久配置。环境文件为 `~/.config/rk-vpn-proxy/env.sh`，备份位于同目录的 `backups/`。安装器在 `.bashrc`、`.profile` 和已存在的优先登录入口中添加加载块，重复执行不会重复添加。
+
+使用 `source` 可让当前终端生效；`curl ... | bash` 只在安装子进程及后续新终端生效。已有终端也可手动加载：
+
+```bash
+source ~/.config/rk-vpn-proxy/env.sh
+curl -I https://www.google.com
+```
+
+不同应用对 `no_proxy` 中 CIDR 的支持不同，内网服务可按具体域名/IP 配置。Git、Java、APT 等应用若另有显式代理配置，应按该应用的实际配置方式处理。
+
+如果客户端可以登录代理主机，也可通过 SSH 获取同一个安装脚本。核对 SSH 主机密钥，按实际账户和项目路径执行：
+
+```bash
+source <(ssh -o StrictHostKeyChecking=ask proxy_user@172.16.14.233 'cat /usr/local/lib/rk-vpn-proxy/build/client-install.sh')
+```
+
+## 运行维护
+
+```bash
+# 代理、防火墙和监控定时器
+systemctl status rk-vpn-proxy.service rk-vpn-proxy-firewall.service rk-vpn-proxy-health.timer
+
+# 健康检查结果和日志
+systemctl status rk-vpn-proxy-health.service
+systemctl show rk-vpn-proxy-health.service -p Result -p ExecMainStatus
 journalctl -u rk-vpn-proxy-health.service -n 30 --no-pager
+
+# 安装脚本下载服务
+systemctl status rk-vpn-proxy-installer.service
+
+# 代理访问日志及出站规则
 sudo tail -f /var/log/rk-vpn-proxy/access.log
 sudo nft list table inet rk_vpn_proxy
 ```
 
-原发行版的 `squid.service` 已屏蔽，避免它使用默认配置启动其他监听。
-代理访问日志由 `/etc/logrotate.d/rk-vpn-proxy` 每天轮转，保留 7 份。
+健康检查是 oneshot 服务，成功执行完毕后显示 inactive 属正常情况，可结合 `Result`、`ExecMainStatus` 和 journal 判断最近执行结果。
 
-## 编译服务器配置
+代理日志位于 `/var/log/rk-vpn-proxy/`，每天轮转并保留 7 份。发行版的默认 Squid 单元在安装 Squid 包时被屏蔽，专用代理由 `rk-vpn-proxy.service` 管理。
 
-使用上方 curl 一键命令即可，无需 SSH 密钥和 sudo。
-安装脚本先验证 Google 的 HTTPS 隧道，成功后才备份并修改该用户的 `.bashrc` / `.profile`，
-若已有 `.bash_profile` / `.bash_login` 则同步补充实际登录入口。
-已打开的编译终端需执行：
+需要重新加载出站规则及代理时：
 
 ```bash
-. ~/.config/rk-vpn-proxy/env.sh
-curl -I https://www.google.com
+sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 ```
 
-`no_proxy` 保留已有条目并补充文档中已知的内网主机；其他内部服务需按实际域名/IP 补充。
-已有 Git、APT、Java 等工具若显式指定了旧代理，需要另外检查相应配置。
-既有进程、其他用户和 systemd 构建任务不会自动继承用户 shell 的环境变量。
-
-## 验证与维护
+### 验证
 
 ```bash
-# 本机真实站点与 TLS 验证
-bash /home/hcq/vpn-proxy/check-client.sh http://127.0.0.1:17897
-
-# 在独立网络命名空间模拟 VPN 掉线与恢复，不断开真实 VPN
-sudo bash /home/hcq/vpn-proxy/test-killswitch.sh
-
-# 重新部署本机服务
-sudo bash /home/hcq/vpn-proxy/install.sh
-
-# 停用本机服务和专用防火墙，保留配置/日志
-sudo bash /home/hcq/vpn-proxy/rollback.sh
+python3 -m unittest discover -s tests -v
+bash check-client.sh
+sudo bash tests/test-killswitch.sh
 ```
 
-下载服务由用户级 `rk-vpn-proxy-installer.service` 管理，随用户管理器启动（本机已启用 linger）。
-服务只提供 `/install.sh`，只接受编译服务器及本机来源，不提供目录浏览或其他文件。
+`check-client.sh` 可传入代理 URL，分别检查 Google、Android 下载/源码站和 GitHub 的 CONNECT、TLS 验证和 HTTP 响应，并汇总退出状态。目标网站返回 400、403 等有效 HTTP 响应不直接视为代理失败；安装器的单个测试 URL 则要求 2xx/3xx。
+
+`tests/test-killswitch.sh` 在独立网络命名空间模拟 VPN 正常、掉线后普通网卡回退、VPN 恢复，验证代理用户的阻断和恢复，以及其他用户的网络连接。不操作真实 VPN 接口。
+
+GitHub Actions 检查 Bash/Python 语法、运行回归测试，并检查生成文件与配置模板的一致性。
+
+### 停用与回滚
 
 ```bash
-systemctl --user status rk-vpn-proxy-installer.service
-journalctl --user -u rk-vpn-proxy-installer.service -n 20 --no-pager
+sudo bash rollback.sh
 ```
 
-修改客户端环境模板后，执行 `python3 /home/hcq/vpn-proxy/build-installer.py` 重新生成独立安装脚本，下载服务无需重启。
-初次部署下载服务时，将同目录的 `rk-vpn-proxy-installer.service` 安装至 `~/.config/systemd/user/`，
-再执行 `systemctl --user daemon-reload` 和 `systemctl --user enable --now rk-vpn-proxy-installer.service`。
+回滚脚本先停用下载服务、代理及健康检查，再删除专用 nftables 表，保留配置和日志。它不卸载软件包，也不自动恢复客户端启动文件。
 
-回退客户端时，删除 `.bashrc` / `.profile` 中的 `rk-vpn-proxy environment` 块（或使用备份恢复），在新终端设置旧 Windows 代理：
+客户端可恢复备份，或删除启动文件中的 `rk-vpn-proxy environment` 加载块，并在当前终端执行：
 
 ```bash
-export http_proxy=http://172.16.14.66:7897
-export https_proxy="$http_proxy" HTTP_PROXY="$http_proxy" HTTPS_PROXY="$http_proxy"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 ```
 
-规则依据：[Squid DNS 配置](https://www.squid-cache.org/Doc/config/dns_nameservers/)、
-[nftables 用户匹配](https://wiki.nftables.org/wiki-nftables/index.php/Matching_packet_metainformation)。
+## 目录与维护职责
+
+```text
+vpn-proxy/
+├── README.md
+├── config.json                  # 部署参数
+├── install.sh / rollback.sh     # 服务端部署与停用
+├── check-client.sh              # 连通性诊断入口
+├── configuration.py             # 共享配置校验
+├── build-installer.py           # 生成部署文件
+├── serve-installer.py           # 安装脚本下载服务
+├── templates/                   # 客户端安装器、Squid 配置模板
+├── scripts/                     # 防火墙与健康检查脚本
+├── systemd/                     # 4 个服务单元和 1 个定时器
+├── tests/                       # Python 回归测试及隔离网络测试
+├── .github/workflows/           # CI
+└── build/                       # 自动生成，不纳入版本控制
+```
+
+拆分按职责和运行边界进行：
+
+- `configuration.py` 同时被生成器、下载服务及诊断工具使用，保留为共享模块。
+- 客户端安装流程与环境配置放在一个模板中，便于维护完整的安装行为。
+- 防火墙、代理、健康检查和下载服务有独立的账户、依赖和启停方式，systemd 单元分别维护；定时器只负责调度。
+- `build/` 中的 `client-install.sh`、`squid.conf` 和 `runtime.env` 都是生成物，可以删除后重新运行 `python3 build-installer.py` 生成。已部署服务使用系统目录中的副本，不依赖源码下的生成目录。
+- 运行日志、安装包、Python 缓存和人工验证记录不属于源码；运行日志由系统日志目录管理，历史审核材料可在项目外归档。

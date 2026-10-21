@@ -1,0 +1,12 @@
+{
+  "listen_host": "172.16.14.233",
+  "advertise_host": "172.16.14.233",
+  "proxy_port": 7897,
+  "health_port": 17897,
+  "installer_port": 8089,
+  "vpn_interface": "ppp0",
+  "allowed_clients": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+  "dns_nameservers": ["8.8.8.8", "1.1.1.1"],
+  "test_url": "https://www.google.com",
+  "no_proxy": ["localhost", "127.0.0.1", "::1"]
+}

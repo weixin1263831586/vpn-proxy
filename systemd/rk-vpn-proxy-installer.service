@@ -1,0 +1,21 @@
+[Unit]
+Description=VPN proxy installer download
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=rk-vpn-installer
+Group=rk-vpn-installer
+Environment=RK_VPN_PROXY_CONFIG=/etc/rk-vpn-proxy/config.json
+ExecStart=/usr/bin/python3 -B /usr/local/lib/rk-vpn-proxy/serve-installer.py
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 [Unit]
-Description=VPN-only egress firewall for the build server proxy
+Description=VPN-only egress firewall for the HTTP proxy
 After=network-pre.target nftables.service ufw.service
 Before=rk-vpn-proxy.service
 

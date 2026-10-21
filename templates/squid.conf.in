@@ -1,7 +1,7 @@
 # LAN proxy and loopback-only health checks. Never listen on the VPN address.
-http_port 172.16.14.233:7897
-http_port 127.0.0.1:17897
-acl build_server src 10.10.10.206/32
+http_port @@LISTEN_HOST@@:@@PROXY_PORT@@
+http_port 127.0.0.1:@@HEALTH_PORT@@
+acl allowed_clients src @@ALLOWED_CLIENTS@@
 acl health_client src 127.0.0.1/32
 acl health_listener localip 127.0.0.1
 acl SSL_ports port 443
@@ -18,12 +18,12 @@ http_access deny to_localhost
 http_access deny to_linklocal
 http_access deny blocked_private
 http_access allow health_client health_listener
-http_access allow build_server
+http_access allow allowed_clients
 http_access deny all
 
-# DNS packets belong to the protected service UID and must also traverse ppp0.
+# DNS packets belong to the protected service UID and must also traverse the configured VPN interface.
 # Avoid the host resolver stub, whose upstream traffic uses a different UID.
-dns_nameservers 8.8.8.8 1.1.1.1
+dns_nameservers @@DNS_NAMESERVERS@@
 cache deny all
 cache_mem 32 MB
 maximum_object_size_in_memory 0 KB

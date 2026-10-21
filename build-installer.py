@@ -1,78 +1,53 @@
 #!/usr/bin/env python3
-"""Build a self-contained installer from the shared client environment."""
+"""Render deployment and client files from one validated configuration."""
+import argparse
 from pathlib import Path
+import shlex
+from configuration import load_config, proxy_url
 
-root = Path(__file__).resolve().parent
-environment = (root / "build-server-proxy.sh").read_text()
-header = r'''#!/bin/bash
-# Run in Bash: source <(curl --noproxy '*' -fsSL http://172.16.14.233:8089/install.sh)
-# Sourcing loads the proxy into the current terminal; piping to Bash configures
-# future terminals and runs the test in that child shell.
-_rk_vpn_install() {
-    if bash <<'RK_VPN_INSTALL_BODY'
-set -euo pipefail
-ip -4 address show | grep -q '10.10.10.206/' || {
-    echo 'This installer is intended for build server 10.10.10.206.' >&2
-    exit 1
-}
-command -v curl >/dev/null
-proxy=http://172.16.14.233:7897
-echo "Checking proxy: $proxy"
-# A failed probe leaves the current persistent settings untouched.
-probe=$(curl --silent --show-error --fail --noproxy '' --proxy "$proxy" \
-    --connect-timeout 20 --max-time 45 --retry 2 --retry-delay 2 \
-    --retry-max-time 90 --retry-connrefused --head --output /dev/null \
-    --write-out '%{http_connect} %{http_code}' https://www.google.com)
-[[ "$probe" == '200 200' ]] || {
-    printf 'Google proxy check failed: %s\n' "$probe" >&2
-    exit 1
-}
-client_dir="$HOME/.config/rk-vpn-proxy"
-mkdir -p "$client_dir/backups"
-backup_dir=$(mktemp -d "$client_dir/backups/$(date +%Y%m%d-%H%M%S).XXXXXX")
-for file in "$client_dir/env.sh" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login"; do
-    [[ ! -f "$file" ]] || cp -p "$file" "$backup_dir/$(basename "$file")"
-done
-temporary_env=$(mktemp "$client_dir/.env.XXXXXX")
-trap 'rm -- "$temporary_env" 2>/dev/null || true' EXIT
-cat > "$temporary_env" <<'RK_VPN_ENVIRONMENT'
-'''
-footer = r'''RK_VPN_ENVIRONMENT
-chmod 0644 "$temporary_env"
-mv -- "$temporary_env" "$client_dir/env.sh"
-trap - EXIT
-startup_files=(.bashrc .profile)
-if [[ -f "$HOME/.bash_profile" ]]; then
-    startup_files+=(.bash_profile)
-elif [[ -f "$HOME/.bash_login" ]]; then
-    startup_files+=(.bash_login)
-fi
-for startup in "${startup_files[@]}"; do
-    target="$HOME/$startup"
-    if ! grep -qF '# rk-vpn-proxy environment' "$target" 2>/dev/null; then
-        cat >> "$target" <<'RK_VPN_STARTUP'
+ROOT = Path(__file__).resolve().parent
 
-# rk-vpn-proxy environment
-if [ -r "$HOME/.config/rk-vpn-proxy/env.sh" ]; then
-    . "$HOME/.config/rk-vpn-proxy/env.sh"
-fi
-RK_VPN_STARTUP
-    fi
-done
-printf 'Installed proxy: %s\nBackups: %s\n' "$proxy" "$backup_dir"
-RK_VPN_INSTALL_BODY
-    then
-        source "$HOME/.config/rk-vpn-proxy/env.sh" || return
-        unset -f _rk_vpn_install
-        printf '\nTesting: curl -I https://www.google.com\n'
-        curl -I --connect-timeout 20 --max-time 45 --retry 2 \
-            --retry-delay 2 --retry-max-time 90 --retry-connrefused https://www.google.com
-    else
-        unset -f _rk_vpn_install
-        echo 'Installation failed; check proxy connectivity and the error above.' >&2
-        return 1
-    fi
-}
-_rk_vpn_install
-'''
-(root / "client-install.sh").write_text(header + environment + footer)
+
+def render(config):
+    installer = (ROOT / "templates/client-install.sh.in").read_text()
+    for key, value in {
+        "PROXY_URL": shlex.quote(proxy_url(config)),
+        "TEST_URL": shlex.quote(config["test_url"]),
+        "NO_PROXY": shlex.quote(",".join(config["no_proxy"])),
+    }.items():
+        installer = installer.replace("@@" + key + "@@", value)
+    squid = (ROOT / "templates/squid.conf.in").read_text()
+    for key in ("listen_host", "proxy_port", "health_port", "allowed_clients", "dns_nameservers"):
+        value = config[key]
+        if isinstance(value, list):
+            value = " ".join(value)
+        squid = squid.replace("@@" + key.upper() + "@@", str(value))
+    runtime = {
+        "VPN_INTERFACE": config["vpn_interface"],
+        "PROXY_BIND_ADDRESS": config["listen_host"],
+        "PROXY_PORT": config["proxy_port"],
+        "HEALTH_PORT": config["health_port"],
+        "INSTALLER_PORT": config["installer_port"],
+        "DNS_CHECK_ADDRESS": config["dns_nameservers"][0],
+        "PROXY_TEST_URL": config["test_url"],
+    }
+    runtime_text = "".join(f"{key}={shlex.quote(str(value))}\n" for key, value in runtime.items())
+    return {"client-install.sh": installer, "squid.conf": squid, "runtime.env": runtime_text}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", help="Deployment JSON configuration")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "build")
+    args = parser.parse_args()
+    outputs = render(load_config(args.config))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in outputs.items():
+        destination = args.output_dir / name
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(content)
+        temporary.replace(destination)
+
+
+if __name__ == "__main__":
+    main()

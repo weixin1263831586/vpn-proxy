@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Serve only the installer to the build server and the local host."""
+"""Serve the installer to client networks selected in the shared config."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from configuration import client_allowed, load_config
 
-INSTALLER = Path(__file__).with_name("client-install.sh")
-ALLOWED_CLIENTS = {"10.10.10.206", "172.16.14.233"}
+INSTALLER = Path(__file__).parent / "build/client-install.sh"
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.client_address[0] not in ALLOWED_CLIENTS:
+        if not client_allowed(self.client_address[0], load_config()):
             self.send_error(403)
             return
         if self.path != "/install.sh":
@@ -25,4 +25,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("172.16.14.233", 8089), Handler).serve_forever()
+    config = load_config()
+    ThreadingHTTPServer((config["listen_host"], config["installer_port"]), Handler).serve_forever()

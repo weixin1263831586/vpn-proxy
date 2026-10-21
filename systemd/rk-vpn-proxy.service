@@ -1,5 +1,5 @@
 [Unit]
-Description=Build server HTTP proxy through the company VPN
+Description=HTTP proxy through the configured VPN
 Wants=network-online.target
 After=network-online.target rk-vpn-proxy-firewall.service
 BindsTo=rk-vpn-proxy-firewall.service
