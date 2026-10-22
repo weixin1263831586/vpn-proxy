@@ -130,8 +130,10 @@ wait_healthy 'fresh deployment installs and forwards traffic.'
 nft list table inet rk_vpn_proxy >/dev/null
 ip rule show | grep -F "lookup 240" >/dev/null
 ip route show table 240 | grep -F "unreachable" >/dev/null
+ip -6 rule show | grep -F 'uidrange' | grep -F "lookup 240" >/dev/null
+ip -6 route show table 240 | grep -F 'unreachable' >/dev/null
 systemctl is-active --quiet rk-vpn-proxy-installer.service
-echo 'PASS: nftables and policy-routing constraints installed; HTTP installer enabled.'
+echo 'PASS: nftables and policy-routing constraints installed for IPv4 and IPv6; HTTP installer enabled.'
 cp /etc/rk-vpn-proxy/config.json "$drill_dir/baseline-config.json"
 cp /etc/rk-vpn-proxy/squid.conf "$drill_dir/baseline-squid.conf"
 if [[ ${DRILL_UFW:-0} == 1 ]] && command -v ufw >/dev/null; then
@@ -237,8 +239,17 @@ fi
 if ip rule show | grep -Fq 'lookup 240'; then
     echo 'FAIL: policy routing rules left after rollback.' >&2; exit 1
 fi
+if ip rule show | grep -Fq 'uidrange'; then
+    echo 'FAIL: proxy UID policy routing rules left after rollback.' >&2; exit 1
+fi
 if [[ -n $(ip route show table 240 2>/dev/null) ]]; then
     echo 'FAIL: policy routing table left after rollback.' >&2; exit 1
+fi
+if ip -6 rule show | grep -Fq 'uidrange'; then
+    echo 'FAIL: IPv6 policy routing rules left after rollback.' >&2; exit 1
+fi
+if [[ -n $(ip -6 route show table 240 2>/dev/null) ]]; then
+    echo 'FAIL: IPv6 policy routing table left after rollback.' >&2; exit 1
 fi
 for unit in rk-vpn-proxy.service rk-vpn-proxy-firewall.service rk-vpn-proxy-installer.service; do
     systemctl is-active --quiet "$unit" && {
@@ -251,4 +262,116 @@ if [[ ${DRILL_UFW:-0} == 1 ]] && command -v ufw >/dev/null; then
     fi
 fi
 echo 'PASS: rollback removes files, services, firewall and owned UFW rules.'
+
+echo "== Scenario H: rollback restores a running legacy deployment =="
+# Simulate an older generation of this project on the host: a proxy system
+# user, a hand-managed nftables table and a Squid under the very unit name
+# the managed installation reuses. The first managed install must snapshot
+# it, and rollback must bring it back with its firewall intact instead of
+# deleting the restored table.
+cat > /etc/rk-legacy-squid.conf <<EOF
+http_port 127.0.0.1:$PROXY_PORT
+acl all_clients src all
+http_access allow all_clients
+cache deny all
+access_log none
+cache_log stdio:/dev/stderr
+pid_filename none
+coredump_dir /tmp
+EOF
+chmod 0644 /etc/rk-legacy-squid.conf
+cat > /etc/systemd/system/rk-vpn-proxy.service <<'EOF'
+[Unit]
+Description=Legacy rk-vpn-proxy generation
+After=network.target
+
+[Service]
+User=rk-vpn-proxy
+ExecStart=/usr/sbin/squid -N -n rkvpnlegacy -f /etc/rk-legacy-squid.conf
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+nft -f - <<'EOF'
+table inet rk_vpn_proxy {
+    chain legacy_marker {
+        counter comment "legacy generation marker"
+    }
+}
+EOF
+systemctl daemon-reload
+systemctl enable --now rk-vpn-proxy.service
+cp /etc/systemd/system/rk-vpn-proxy.service "$drill_dir/legacy-unit"
+for attempt in $(seq 1 30); do
+    forward_ok && break
+    sleep 1
+done
+forward_ok
+echo 'PASS: legacy proxy generation is running behind its own nftables table.'
+run_install "$drill_dir/config1.json" "$drill_dir/install-h.log"
+wait_healthy 'managed upgrade installs over the running legacy deployment.'
+bash "$source_dir/rollback.sh" > "$drill_dir/rollback-h.log" 2>&1
+cmp /etc/systemd/system/rk-vpn-proxy.service "$drill_dir/legacy-unit"
+nft list table inet rk_vpn_proxy | grep -F 'legacy generation marker' >/dev/null
+systemctl is-active --quiet rk-vpn-proxy.service
+[[ ! -e /etc/rk-vpn-proxy ]]
+if ip rule show | grep -Fq 'uidrange'; then
+    echo 'FAIL: managed policy routing left after legacy rollback.' >&2; exit 1
+fi
+if [[ -n $(ip route show table 240 2>/dev/null) || -n $(ip -6 route show table 240 2>/dev/null) ]]; then
+    echo 'FAIL: managed routing tables left after legacy rollback.' >&2; exit 1
+fi
+wait_healthy 'rollback restores the legacy proxy with its original firewall.'
+echo 'PASS: rollback restores a running legacy proxy and keeps its firewall.'
+
+echo "== Scenario H2: interrupted first install leaves no policy routing behind =="
+systemctl disable --now rk-vpn-proxy.service >/dev/null 2>&1
+rm -f /etc/systemd/system/rk-vpn-proxy.service /etc/rk-legacy-squid.conf
+nft delete table inet rk_vpn_proxy
+systemctl daemon-reload
+bash "$source_dir/install.sh" "$drill_dir/config2.json" > "$drill_dir/install-h2.log" 2>&1 &
+install_pid=$!
+interrupted=0
+for attempt in $(seq 1 600); do
+    if systemctl is-active --quiet rk-vpn-proxy.service && ip rule show | grep -qF 'uidrange'; then
+        kill -9 "$install_pid" 2>/dev/null || true
+        interrupted=1
+        break
+    fi
+    kill -0 "$install_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [[ "$interrupted" != 1 ]]; then
+    echo 'FAIL: could not interrupt the first install after services started.' >&2
+    kill "$install_pid" 2>/dev/null || true
+    exit 1
+fi
+wait "$install_pid" 2>/dev/null || true
+sleep 3  # let orphaned systemctl calls finish
+latest=$(ls -1 /var/lib/rk-vpn-proxy-deploy/transactions | sort | tail -1)
+[[ -f "/var/lib/rk-vpn-proxy-deploy/transactions/$latest/state.json" ]]
+flock /run/lock/rk-vpn-proxy-deploy.lock \
+    python3 -B "$source_dir/scripts/deployment.py" restore \
+    "/var/lib/rk-vpn-proxy-deploy/transactions/$latest"
+[[ ! -e /etc/rk-vpn-proxy && ! -e /usr/local/libexec/rk-vpn-proxy-firewall ]]
+compgen -G '/etc/systemd/system/rk-vpn-proxy-*' >/dev/null && {
+    echo 'FAIL: unit files left behind.' >&2; exit 1;
+}
+if nft list table inet rk_vpn_proxy >/dev/null 2>&1; then
+    echo 'FAIL: dedicated nftables table left after interrupted first install.' >&2; exit 1
+fi
+if ip rule show | grep -qF 'uidrange' || ip -6 rule show | grep -qF 'uidrange'; then
+    echo 'FAIL: policy routing rules left after interrupted first install.' >&2; exit 1
+fi
+if [[ -n $(ip route show table 240 2>/dev/null) || -n $(ip -6 route show table 240 2>/dev/null) ]]; then
+    echo 'FAIL: policy routing table left after interrupted first install.' >&2; exit 1
+fi
+for unit in rk-vpn-proxy.service rk-vpn-proxy-firewall.service; do
+    systemctl is-active --quiet "$unit" && {
+        echo "FAIL: $unit still active after restore." >&2; exit 1;
+    }
+done
+echo 'PASS: interrupted first install restores a clean host with no policy-routing residue.'
+
 echo 'ALL DRILL SCENARIOS PASSED'

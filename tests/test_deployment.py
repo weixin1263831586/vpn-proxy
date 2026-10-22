@@ -119,6 +119,92 @@ class DeploymentRecovery(unittest.TestCase):
                 DEPLOY.stop_services()
 
 
+class PolicyRoutingRecovery(unittest.TestCase):
+    @staticmethod
+    def fake_run_factory(state, fail_del=False):
+        def fake_run(*args, check=True):
+            code, output = 0, ""
+            if args[0] == "id":
+                output = "149"
+            elif args[0] == "ip":
+                family = args[1].lstrip("-")
+                words = list(args[2:])
+                if words[:2] == ["rule", "show"]:
+                    output = "\n".join(state[f"rules{family}"]) + ("\n" if state[f"rules{family}"] else "")
+                elif words[:2] == ["rule", "add"]:
+                    state[f"rules{family}"].append(f"{words[3]}: {' '.join(words[4:])}")
+                elif words[:2] == ["rule", "del"]:
+                    pref, rest = words[3], " ".join(words[4:])
+                    new = [line for line in state[f"rules{family}"]
+                           if not (line.split(":", 1)[0] == pref and
+                                   (not rest or line.split(":", 1)[1].strip() == rest))]
+                    if fail_del and len(new) != len(state[f"rules{family}"]):
+                        code = 2
+                    else:
+                        state[f"rules{family}"] = new
+                elif words[:2] == ["route", "show"]:
+                    output = "\n".join(state[f"routes{family}"]) + ("\n" if state[f"routes{family}"] else "")
+                elif words[:2] == ["route", "add"]:
+                    state[f"routes{family}"].append(" ".join(words[2:-2]))
+                elif words[:2] == ["route", "del"]:
+                    line = " ".join(words[2:-2])
+                    state[f"routes{family}"] = [entry for entry in state[f"routes{family}"] if entry != line]
+            return subprocess.CompletedProcess(args, code, output, "")
+        return fake_run
+
+    def apply_patches(self, state, fail_del=False):
+        run_patch = patch.object(DEPLOY, "run", side_effect=self.fake_run_factory(state, fail_del))
+        which_patch = patch.object(DEPLOY.shutil, "which", return_value="ip")
+        return run_patch, which_patch
+
+    def test_restore_purges_owned_rules_and_keeps_foreign_state(self):
+        state = {
+            "rules4": ["90: uidrange 149-149 to 10.0.0.0/8 lookup main",
+                       "95: from all lookup 50",
+                       "100: uidrange 149-149 lookup 240"],
+            "routes4": ["default via 203.0.113.1 dev ppp0 metric 100",
+                        "unreachable default metric 200",
+                        "10.99.0.0/16 via 192.0.2.1"],
+            "rules6": ["91: uidrange 149-149 lookup 240"],
+            "routes6": ["unreachable default dev lo metric 200 pref medium"],
+        }
+        run, which = self.apply_patches(state)
+        with run, which:
+            snapshotted = DEPLOY.snapshot_policy_routing()
+            self.assertEqual(snapshotted["rules"], [
+                {"family": 4, "pref": 90, "rule": "uidrange 149-149 to 10.0.0.0/8 lookup main"},
+                {"family": 4, "pref": 100, "rule": "uidrange 149-149 lookup 240"},
+                {"family": 6, "pref": 91, "rule": "uidrange 149-149 lookup 240"}])
+            self.assertEqual(snapshotted["routes"], [
+                {"family": 4, "route": "default via 203.0.113.1 dev ppp0 metric 100"},
+                {"family": 4, "route": "unreachable default metric 200"},
+                {"family": 4, "route": "10.99.0.0/16 via 192.0.2.1"},
+                {"family": 6, "route": "unreachable default dev lo metric 200 pref medium"}])
+            DEPLOY.restore_policy_routing({"rules": [], "routes": []})
+        self.assertEqual(state["rules4"], ["95: from all lookup 50"])
+        self.assertEqual(state["routes4"], ["10.99.0.0/16 via 192.0.2.1"])
+        self.assertEqual(state["rules6"], [])
+        self.assertEqual(state["routes6"], [])
+
+    def test_restore_reinstates_snapshotted_policy_routing(self):
+        state = {"rules4": [], "routes4": [], "rules6": [], "routes6": []}
+        saved = {"rules": [{"family": 4, "pref": 88, "rule": "uidrange 149-149 to 10.0.0.0/8 lookup main"}],
+                 "routes": [{"family": 6, "route": "unreachable default metric 200"}]}
+        run, which = self.apply_patches(state)
+        with run, which:
+            DEPLOY.restore_policy_routing(saved)
+        self.assertEqual(state["rules4"], ["88: uidrange 149-149 to 10.0.0.0/8 lookup main"])
+        self.assertEqual(state["routes6"], ["unreachable default metric 200"])
+
+    def test_restore_fails_loudly_when_owned_rules_survive(self):
+        state = {"rules4": ["100: uidrange 149-149 lookup 240"], "routes4": [],
+                 "rules6": [], "routes6": []}
+        run, which = self.apply_patches(state, fail_del=True)
+        with run, which:
+            with self.assertRaisesRegex(RuntimeError, "did not return to the snapshot state"):
+                DEPLOY.restore_policy_routing({"rules": [], "routes": []})
+
+
 class HealthState(unittest.TestCase):
     def test_health_separates_firewall_vpn_and_proxy_and_checks_marker_freshness(self):
         with tempfile.TemporaryDirectory() as directory:

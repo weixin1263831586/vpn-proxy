@@ -14,6 +14,9 @@ cp -- "$config_path" "$build_dir/config.json"
 config_path="$build_dir/config.json"
 python3 -B "$source_dir/build-installer.py" --config "$config_path" --output-dir "$build_dir"
 source "$build_dir/runtime.env"
+# Refuse routing resources another service owns before creating accounts or
+# changing package/service state; re-checked during --validate after setup.
+bash "$source_dir/scripts/firewall.sh" --precheck
 if [[ "$PROXY_BIND_ADDRESS" != 0.0.0.0 ]]; then
     ip -4 address show | grep -Fq "$PROXY_BIND_ADDRESS/" || {
         echo "Configured listen address is not on this host: $PROXY_BIND_ADDRESS" >&2; exit 1;

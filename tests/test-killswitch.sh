@@ -51,7 +51,7 @@ sys.path.insert(0, sys.argv[1])
 from configuration import load_config
 config = load_config()
 config.update(listen_host="127.0.0.2", advertise_host="127.0.0.2", vpn_interface="rk-test-vpn",
-              allowed_clients=["127.0.0.0/8"])
+              allowed_clients=["127.0.0.0/8"] + [f"10.60.{i}.0/24" for i in range(10)])
 Path(sys.argv[2], "config.json").write_text(json.dumps(config))
 PY
 python3 -B "$source_dir/build-installer.py" --config "$test_dir/config.json" --output-dir "$test_dir/build"
@@ -62,7 +62,7 @@ source "$RK_VPN_RUNTIME"
 sed -i "s|/var/log/rk-vpn-proxy|$test_dir/logs|g; s|/run/rk-vpn-proxy|$test_dir/logs|g" "$test_dir/build/squid.conf"
 install -d -o rk-vpn-proxy -g rk-vpn-proxy -m 0750 "$test_dir/logs"
 runuser -u rk-vpn-proxy -- squid -k parse -f "$test_dir/build/squid.conf"
-unshare --net -- sleep 120 &
+unshare --net -- sleep 600 &
 server_pid=$!
 for attempt in {1..50}; do
     [[ $(readlink "/proc/$server_pid/ns/net") != "$(readlink /proc/self/ns/net)" ]] && break
@@ -76,15 +76,18 @@ ip link set vpn-peer netns "$server_pid"
 ip link set lan-peer netns "$server_pid"
 ip address add 203.0.113.2/24 dev "$VPN_INTERFACE"
 ip address add 198.51.100.2/24 dev "$fallback_interface"
+ip -6 address add fd00:198:51:100::2/64 dev "$fallback_interface"
 ip link set "$VPN_INTERFACE" up
 ip link set "$fallback_interface" up
 nsenter -t "$server_pid" -n ip address add 203.0.113.1/24 dev vpn-peer
 nsenter -t "$server_pid" -n ip address add 198.51.100.1/24 dev lan-peer
 nsenter -t "$server_pid" -n ip address add 1.1.1.1/32 dev lo
+nsenter -t "$server_pid" -n ip -6 address add fd00:198:51:100::1/64 dev lan-peer
 nsenter -t "$server_pid" -n ip link set vpn-peer up
 nsenter -t "$server_pid" -n ip link set lan-peer up
 ip route add default via 203.0.113.1 dev "$VPN_INTERFACE" metric 50
 ip route add default via 198.51.100.1 dev "$fallback_interface" metric 100
+ip -6 route add default via fd00:198:51:100::1 dev "$fallback_interface"
 nsenter -t "$server_pid" -n python3 -m http.server 80 --bind 0.0.0.0 --directory /tmp >/dev/null 2>&1 &
 http_pid=$!
 start_guard() {
@@ -105,6 +108,27 @@ for attempt in {1..50}; do
     sleep 0.1
 done
 bash "$source_dir/scripts/firewall.sh" --check
+# 11 client networks must keep distinct preferences strictly before the
+# catch-all egress rule (fixed preferences collided from the 10th client on).
+proxy_uid=$(id -u rk-vpn-proxy)
+base_pref=$(ip rule show | grep -F "uidrange $proxy_uid-$proxy_uid lookup 240" | cut -d: -f1)
+[[ -n "$base_pref" ]] || { echo 'FAIL: no egress policy rule present.' >&2; exit 1; }
+client_prefs=$(ip rule show | grep -F "uidrange $proxy_uid-$proxy_uid" | grep -F 'lookup main' | cut -d: -f1)
+[[ $(wc -l <<<"$client_prefs") -eq 11 ]] || { echo "FAIL: expected 11 client rules, got $(wc -l <<<"$client_prefs")." >&2; exit 1; }
+for pref in $client_prefs; do
+    (( pref < base_pref )) || { echo "FAIL: client rule pref $pref not before egress rule pref $base_pref." >&2; exit 1; }
+done
+[[ $(sort -n <<<"$client_prefs" | uniq | wc -l) -eq 11 ]] || { echo 'FAIL: duplicate client rule preferences.' >&2; exit 1; }
+# The second layer covers IPv6 too: with a fallback IPv6 default route in
+# place, the proxy UID must have no IPv6 egress at all.
+ip -6 rule show | grep -F "uidrange $proxy_uid-$proxy_uid lookup 240" >/dev/null
+ip -6 route show table 240 | grep -F 'unreachable default' >/dev/null
+ip -6 route get 2001:db8::1 | grep -F "dev $fallback_interface" >/dev/null
+if runuser -u rk-vpn-proxy -- ip -6 route get 2001:db8::1 >/dev/null 2>&1; then
+    echo 'FAIL: proxy UID can route IPv6 egress through the fallback.' >&2
+    exit 1
+fi
+echo 'PASS: 11 client rules keep distinct ordered preferences; IPv6 egress is unreachable for the proxy UID.'
 if [[ "$systemd_test" == --systemd ]]; then
     systemd-run --quiet --unit="$proxy_unit" --property="BindsTo=$guard_unit" --property="After=$guard_unit" \
         --property=User=rk-vpn-proxy --property=Restart=always \
@@ -253,6 +277,11 @@ if [[ "$systemd_test" == --systemd ]]; then
         exit 1
     fi
     echo 'PASS: gate 2 - deleting the whole nftables table still forwards zero requests via the fallback interface.'
+    if runuser -u rk-vpn-proxy -- ip -6 route get 2001:db8::1 >/dev/null 2>&1; then
+        echo 'FAIL: IPv6 egress became reachable for the proxy UID after nftables deletion.' >&2
+        exit 1
+    fi
+    echo 'PASS: IPv6 egress stays unreachable after nftables deletion.'
 fi
 # The watch daemon must restore deleted policy routing rules on its own.
 ip link set "$VPN_INTERFACE" up
@@ -279,3 +308,30 @@ fi
 bash "$source_dir/scripts/firewall.sh" --check
 proxy_probe
 echo 'PASS: watch daemon restores deleted policy routing rules.'
+
+# A full VPN interface rebuild (gone, re-enumerated, new address and gateway)
+# must keep the proxy blocked while the interface is missing and self-heal
+# the mirrored default route afterwards.
+ip link del "$VPN_INTERFACE"
+sleep 1.5
+if probe 2>/dev/null; then
+    echo 'FAIL: proxy UID forwarded while the VPN interface was gone.' >&2; exit 1
+fi
+ip link add "$VPN_INTERFACE" type veth peer name vpn-peer
+ip link set vpn-peer netns "$server_pid"
+ip address add 203.0.114.2/24 dev "$VPN_INTERFACE"
+ip link set "$VPN_INTERFACE" up
+nsenter -t "$server_pid" -n ip address add 203.0.114.1/24 dev vpn-peer
+nsenter -t "$server_pid" -n ip link set vpn-peer up
+ip route add default via 203.0.114.1 dev "$VPN_INTERFACE" metric 50
+for attempt in {1..50}; do
+    ip route show table 240 2>/dev/null | grep -qF 'via 203.0.114.1' && break
+    sleep 0.1
+done
+ip route show table 240 | grep -F 'via 203.0.114.1' || {
+    echo 'FAIL: watch daemon did not mirror the rebuilt VPN default route.' >&2; exit 1;
+}
+bash "$source_dir/scripts/firewall.sh" --check
+probe
+proxy_probe
+echo 'PASS: VPN interface rebuild with a new gateway stays blocked and self-heals.'

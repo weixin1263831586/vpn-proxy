@@ -19,6 +19,9 @@ FILES = ["/etc/rk-vpn-proxy", "/usr/local/lib/rk-vpn-proxy",
          "/usr/local/libexec/rk-vpn-proxy-firewall", "/usr/local/libexec/rk-vpn-proxy-health",
          "/etc/logrotate.d/rk-vpn-proxy"] + ["/etc/systemd/system/" + name for name in SERVICES]
 TAGS = {"rk-vpn-proxy", "rk-vpn-installer"}
+ROUTING_TABLE = os.environ.get("RK_VPN_ROUTING_TABLE", "240")
+POLICY_LOOKUPS = (f"lookup {ROUTING_TABLE}", "lookup main")
+PROXY_USER = "rk-vpn-proxy"
 
 
 def run(*args, check=True):
@@ -97,9 +100,102 @@ def remove_path(path):
         shutil.rmtree(path)
 
 
+def owned_policy_route(line):
+    # Exact routes the firewall script writes into the routing table: the
+    # mirrored metric-100 VPN default and the metric-200 unreachable fallback
+    # (IPv6 listings add "dev lo" and "pref medium" around the metric).
+    if line.startswith("unreachable default") and f" metric 200 " in f" {line} ":
+        return True
+    return line.startswith("default ") and f" metric 100 " in f" {line} "
+
+
+def policy_rules(family):
+    result = run("ip", f"-{family}", "rule", "show", check=False)
+    if result.returncode:
+        return []
+    rules = []
+    for line in result.stdout.splitlines():
+        pref, _, rest = line.partition(":")
+        if pref.isdigit():
+            rules.append((int(pref), rest.strip()))
+    return rules
+
+
+def policy_routes(family):
+    result = run("ip", f"-{family}", "route", "show", "table", ROUTING_TABLE, check=False)
+    if result.returncode:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def snapshot_policy_routing():
+    """Record the policy-routing state so a failed first install restores it."""
+    state = {"rules": [], "routes": []}
+    uid = run("id", "-u", PROXY_USER, check=False)
+    selector = f"uidrange {uid.stdout.strip()}-{uid.stdout.strip()}" if uid.returncode == 0 and uid.stdout.strip() else None
+    if selector is None or not shutil.which("ip"):
+        return state
+    for family in (4, 6):
+        for pref, rest in policy_rules(family):
+            if selector in rest and any(f" {lookup}" in f" {rest}" for lookup in POLICY_LOOKUPS):
+                state["rules"].append({"family": family, "pref": pref, "rule": rest})
+        for route in policy_routes(family):
+            state["routes"].append({"family": family, "route": route})
+    return state
+
+
+def restore_policy_routing(saved):
+    """Remove what this deployment added to policy routing and reinstate the
+    snapshot, then verify the result: only project-owned rules may vanish."""
+    uid = run("id", "-u", PROXY_USER, check=False)
+    selector = f"uidrange {uid.stdout.strip()}-{uid.stdout.strip()}" if uid.returncode == 0 and uid.stdout.strip() else None
+    if selector is None or not shutil.which("ip"):
+        return
+    saved_rules = {(entry["family"], entry["pref"], entry["rule"]) for entry in saved["rules"]}
+    saved_routes = {(entry["family"], entry["route"]) for entry in saved["routes"]}
+    for family in (4, 6):
+        for _ in range(3):
+            doomed = [(pref, rest) for pref, rest in policy_rules(family)
+                      if selector in rest and any(f" {lookup}" in f" {rest}" for lookup in POLICY_LOOKUPS)
+                      and (family, pref, rest) not in saved_rules]
+            if not doomed:
+                break
+            for pref, rest in doomed:
+                run("ip", f"-{family}", "rule", "del", "pref", str(pref), *shlex.split(rest), check=False)
+        for route in policy_routes(family):
+            if owned_policy_route(route) and (family, route) not in saved_routes:
+                run("ip", f"-{family}", "route", "del", *shlex.split(route),
+                    "table", ROUTING_TABLE, check=False)
+
+    def current_policy():
+        rules = {(family, pref, rest) for family in (4, 6)
+                 for pref, rest in policy_rules(family) if selector in rest}
+        routes = {(family, route) for family in (4, 6) for route in policy_routes(family)}
+        return rules, routes
+
+    rules, routes = current_policy()
+    for family, pref, rest in sorted(saved_rules - rules):
+        run("ip", f"-{family}", "rule", "add", "pref", str(pref), *shlex.split(rest), check=False)
+    for family, route in sorted(saved_routes - routes):
+        run("ip", f"-{family}", "route", "add", *shlex.split(route),
+            "table", ROUTING_TABLE, check=False)
+    rules, routes = current_policy()
+    ours_rules = {entry for entry in rules
+                  if any(f" {lookup}" in f" {entry[2]}" for lookup in POLICY_LOOKUPS)}
+    if ours_rules != saved_rules:
+        raise RuntimeError(f"policy-routing rules did not return to the snapshot state: "
+                           f"leftover={sorted(ours_rules - saved_rules)} missing={sorted(saved_rules - ours_rules)}")
+    leftover_routes = {entry for entry in routes
+                       if owned_policy_route(entry[1]) and entry not in saved_routes}
+    if leftover_routes:
+        raise RuntimeError(f"routing table {ROUTING_TABLE} still contains project routes "
+                           f"after restore: {sorted(leftover_routes)}")
+
+
 def snapshot(directory):
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
-    state = {"files": [], "services": {}, "ufw": [rule for rule in ufw_rules() if owned(rule)]}
+    state = {"files": [], "services": {}, "ufw": [rule for rule in ufw_rules() if owned(rule)],
+             "policy_routing": snapshot_policy_routing()}
     for filename in FILES:
         path = Path(filename)
         present = path.exists() or path.is_symlink()
@@ -143,6 +239,9 @@ def restore_state(directory, state):
         run("systemctl", "disable", name, check=False)
     # Restore UFW before services, so a failure leaves the proxy stopped.
     reconcile_ufw(state["ufw"])
+    # Snapshots from older versions have no policy-routing section; they can
+    # only predate the feature, so restoring means removing what it adds.
+    restore_policy_routing(state.get("policy_routing") or {"rules": [], "routes": []})
     for filename, present in state["files"]:
         path = Path(filename)
         remove_path(path)
