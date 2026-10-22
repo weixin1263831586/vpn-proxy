@@ -18,6 +18,7 @@
 | `vpn_interface` | 允许代理使用的 VPN 出站接口 |
 | `allowed_clients` | 允许访问代理及下载服务的来源 CIDR 列表 |
 | `allow_public_clients` | 可选，默认 false；公网来源需显式开启，仍拒绝 /0 |
+| `installer_enabled` | 可选，默认 false；是否启用 HTTP 安装脚本下载入口 |
 | `dns_nameservers` | Squid 使用的 IPv4 DNS 服务器 |
 | `test_url` | 客户端安装时验证的 HTTPS 地址 |
 | `no_proxy` | 合并进客户端 `no_proxy` 的默认条目 |
@@ -28,7 +29,7 @@
 "allowed_clients": ["10.10.10.0/24", "172.16.14.0/24"]
 ```
 
-代理与安装脚本下载服务目前共用这一份来源白名单；需要更细的区分时应单独评估。
+代理与安装脚本下载服务目前共用这一份来源白名单；需要更细的区分时应单独评估。HTTP 下载入口默认关闭（`installer_enabled` 默认 false），需要一键安装的部署应显式设置为 true；关闭时安装器会停用并禁用下载服务，UFW 也不再放行下载端口。
 
 ```bash
 cd /path/to/vpn-proxy
@@ -41,7 +42,7 @@ sudo bash install.sh
 
 部署记录位于 `/var/lib/rk-vpn-proxy-deploy/`（0700）：`transactions/` 保留每次尝试的快照，`original/` 保存第一次成功托管部署之前的基线。升级旧部署时，这份基线就是升级前的版本。软件包、新增系统账户、运行日志不回退；磁盘故障、断电或 SIGKILL 需人工恢复。
 
-UFW 活跃时同步来源和两个端口。更新配置会清理旧规则；注释 `rk-vpn-proxy`、`rk-vpn-installer` 是项目保留标记，历史同标记规则也会纳入管理。已有相同选择条件的管理员规则不改归属，其他规则保留。UFW 关闭时只移除旧项目规则，不自动启用 UFW。
+UFW 活跃时同步来源和放行端口（HTTP 下载入口启用时含下载端口）。更新配置会清理旧规则；注释 `rk-vpn-proxy`、`rk-vpn-installer` 是项目保留标记，历史同标记规则也会纳入管理。已有相同选择条件的管理员规则不改归属，其他规则保留。UFW 关闭时只移除旧项目规则，不自动启用 UFW。
 
 项目没有配置带宽或下载速率限制，实际吞吐量取决于 VPN、代理主机网络、目标站点及并发负载。
 
@@ -211,9 +212,9 @@ sudo bash tests/test-killswitch.sh --systemd
 
 `check-client.sh` 可传入代理 URL，分别检查 Google、Android 下载/源码站和 GitHub 的 CONNECT、TLS 验证和 HTTP 响应，并汇总退出状态。目标网站返回 400、403 等有效 HTTP 响应不直接视为代理失败；安装器的单个测试 URL 则要求 2xx/3xx。
 
-`tests/test-killswitch.sh` 使用源码和临时配置，在独立网络命名空间启动真实 Squid，模拟 VPN 正常、掉线、恢复及专用规则损坏。`--systemd` 额外创建临时测试单元验证守护失败后实际代理被停止，并以高频请求测量从删除专用规则到代理真正停止期间经备用网卡转发的请求数：删除前基线为零，停止后不再有请求，窗口内的实际转发数打印在 PASS 行中。结束时清理单元和临时文件。测试无需预先部署，首次测试可能创建代理系统用户；不会修改正式配置或操作真实 VPN。
+`tests/test-killswitch.sh` 使用源码和临时配置，在独立网络命名空间启动真实 Squid，模拟 VPN 正常、掉线、恢复及专用规则损坏。`--systemd` 额外创建临时测试单元，并以高频请求执行两道零泄漏验收门禁（任何非零计数直接判失败）：门禁 1 为 VPN 正常掉线期间经备用网卡转发必须为零；门禁 2 为删除整个 nftables 表到代理被 systemd 停止期间仍必须为零（由第二层策略路由兜底）。测试还验证守护进程会在约 1 秒内自愈被删除的策略路由规则。结束时清理单元和临时文件。测试无需预先部署，首次测试可能创建代理系统用户；不会修改正式配置或操作真实 VPN。
 
-`tests/test-deployment-drill.sh` 在真实 Ubuntu 系统（容器、VM 或 CI 运行器）上执行部署故障注入演练。脚本拒绝在已有 rk-vpn-proxy 部署的主机上运行，只能用于一次性环境。覆盖场景：
+`tests/test-deployment-drill.sh` 在真实 Ubuntu 系统（容器、VM 或 CI 运行器）上执行部署故障注入演练。脚本会移除软件包、改写 APT 源并故意中断服务，因此必须同时满足两个条件才会运行：显式设置 `DRILL_CONFIRM_DISPOSABLE=1` 表明这是一次性测试环境，且主机上没有已有 rk-vpn-proxy 部署。覆盖场景：
 
 | 注入的故障 | 验证结果 |
 | --- | --- |
@@ -221,15 +222,17 @@ sudo bash tests/test-killswitch.sh --systemd
 | 安装期间 apt 下载失败 | 不残留半成品部署，安装前状态保持一致（含 `squid.service` 屏蔽状态；注意 `apt-get remove squid` 自身会留下屏蔽） |
 | 安装中途 SIGTERM | 自动恢复上一个部署 |
 | 安装中途 SIGKILL（模拟断电） | 依据事务快照人工恢复成功 |
-| 完整回滚 | 文件、服务、专用 nftables 表及项目 UFW 规则全部移除 |
+| 关闭 HTTP 安装入口（`installer_enabled=false`） | 下载服务停用并禁用，UFW 不再放行下载端口，代理不受影响 |
+| 完整回滚 | 文件、服务、专用 nftables 表、策略路由及项目 UFW 规则全部移除 |
 
 可选环境变量：`DRILL_TEST_URL`、`DRILL_DNS`、`DRILL_UFW=1`（演练 UFW 活跃时的规则同步与回滚清理）。Docker 示例：
 
 ```bash
-docker run --privileged -d --name vpn-proxy-drill ubuntu:24.04 /sbin/init
+docker run --privileged -d --name vpn-proxy-drill ubuntu:24.04 bash -c \
+  'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y systemd systemd-sysv && exec /sbin/init'
 docker exec vpn-proxy-drill bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y squid nftables curl iproute2 ufw'
 docker cp . vpn-proxy-drill:/opt/vpn-proxy
-docker exec vpn-proxy-drill bash -c 'DRILL_UFW=1 bash /opt/vpn-proxy/tests/test-deployment-drill.sh'
+docker exec vpn-proxy-drill bash -c 'DRILL_CONFIRM_DISPOSABLE=1 DRILL_UFW=1 bash /opt/vpn-proxy/tests/test-deployment-drill.sh'
 docker rm -f vpn-proxy-drill
 ```
 
@@ -241,7 +244,7 @@ GitHub Actions 运行语法、回归、生成一致性、Linux 隔离集成及 W
 sudo bash rollback.sh
 ```
 
-有 `original/` 基线时，回滚先停止项目服务，再恢复原文件、项目 UFW 规则、专用 nftables 表及服务启用/运行状态（包括发行版 Squid 的屏蔽状态），成功后归档基线。恢复途中失败会保持代理停用并报错。没有基线的旧安装只停用项目服务、清理专用表和项目 UFW 规则，不猜测安装前的发行版服务状态。软件包、账户、日志及客户端配置保留。
+有 `original/` 基线时，回滚先停止项目服务，再恢复原文件、项目 UFW 规则、专用 nftables 表、代理 UID 策略路由（规则与专用表）及服务启用/运行状态（包括发行版 Squid 的屏蔽状态），成功后归档基线。恢复途中失败会保持代理停用并报错。没有基线的旧安装只停用项目服务、清理专用表和项目 UFW 规则，不猜测安装前的发行版服务状态。软件包、账户、日志及客户端配置保留。
 
 需要人工恢复某次失败安装时，可先检查对应快照，再以 root 执行（不要与部署并行）：
 

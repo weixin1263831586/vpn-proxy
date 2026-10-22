@@ -25,6 +25,8 @@ def load_config(path=None):
         raise ValueError("Configure at least one allowed client network")
     if type(config.get("allow_public_clients", False)) is not bool:
         raise ValueError("allow_public_clients must be a boolean")
+    if type(config.get("installer_enabled", False)) is not bool:
+        raise ValueError("installer_enabled must be a boolean")
     private_ranges = [ipaddress.ip_network(value) for value in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")]
     for network in networks:
@@ -35,6 +37,7 @@ def load_config(path=None):
                 for private in private_ranges):
             raise ValueError("Public client networks require allow_public_clients=true")
     config["allowed_clients"] = [str(network) for network in networks]
+    config["installer_enabled"] = config.get("installer_enabled", False)
     for address in config["dns_nameservers"]:
         ipaddress.IPv4Address(address)
     if not config["dns_nameservers"]:

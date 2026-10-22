@@ -109,9 +109,9 @@ if [[ "$systemd_test" == --systemd ]]; then
     systemd-run --quiet --unit="$proxy_unit" --property="BindsTo=$guard_unit" --property="After=$guard_unit" \
         --property=User=rk-vpn-proxy --property=Restart=always \
         --property="NetworkNamespacePath=/proc/$$/ns/net" \
-        /usr/sbin/squid -N -f "$test_dir/build/squid.conf"
+        /usr/sbin/squid -N -n rkvpntest -f "$test_dir/build/squid.conf"
 else
-    runuser -u rk-vpn-proxy -- squid -N -f "$test_dir/build/squid.conf" > "$test_dir/squid.log" 2>&1 &
+    runuser -u rk-vpn-proxy -- squid -N -n rkvpntest -f "$test_dir/build/squid.conf" > "$test_dir/squid.log" 2>&1 &
     proxy_pid=$!
 fi
 probe() {
@@ -148,6 +148,12 @@ fi
 echo 'PASS: VPN down blocks the proxy UID while other users retain LAN connectivity.'
 ip link set "$VPN_INTERFACE" up
 ip route replace default via 203.0.113.1 dev "$VPN_INTERFACE" metric 50
+# The kernel drops device routes on link-down and does not restore them; wait
+# for the watch daemon to re-add the VPN route in the policy routing table.
+for attempt in {1..50}; do
+    ip route show table 240 2>/dev/null | grep -qF "dev $VPN_INTERFACE" && break
+    sleep 0.1
+done
 probe
 proxy_probe
 printf "PASS: proxy traffic recovers automatically when %s returns.\n" "$VPN_INTERFACE"
@@ -193,15 +199,16 @@ nft delete table inet rk_vpn_proxy
 assert_guard_failed
 echo 'PASS: missing firewall table fails the guard.'
 if [[ "$systemd_test" == --systemd ]]; then
-    # Measure the detection window: how many requests Squid still forwards via
-    # the fallback interface between rule deletion and the guard-triggered stop.
+    # Zero-leak gates: with the second policy-routing layer in place, BOTH a
+    # plain VPN loss and full deletion of the nftables table must forward zero
+    # requests through the fallback interface. Any non-zero count fails CI.
     systemctl start "$guard_unit" "$proxy_unit"
     leak_ready=0
     for attempt in {1..50}; do
         if proxy_probe 2>/dev/null; then leak_ready=1; break; fi
         sleep 0.1
     done
-    [[ "$leak_ready" == 1 ]] || { echo 'FAIL: proxy did not restart for the leak measurement.' >&2; exit 1; }
+    [[ "$leak_ready" == 1 ]] || { echo 'FAIL: proxy did not restart for the leak gates.' >&2; exit 1; }
     ip link set "$VPN_INTERFACE" down
     ip route get 1.1.1.1 | grep -F "dev $fallback_interface"
     blocked=0
@@ -217,15 +224,17 @@ if [[ "$systemd_test" == --systemd ]]; then
     probe_leaks() {
         while [[ ! -f "$stop_probes" ]]; do
             if proxy_probe 2>/dev/null; then printf 'x\n' >> "$leak_log"; fi
+            sleep 0.02
         done
     }
     probe_leaks &
     leak_pid=$!
-    sleep 0.5
+    sleep 2
     if [[ -s "$leak_log" ]]; then
-        echo 'FAIL: requests were forwarded via the fallback while rules were intact.' >&2
+        echo "FAIL: gate 1 - VPN loss alone forwarded $(wc -l < "$leak_log") request(s) via the fallback interface." >&2
         exit 1
     fi
+    echo 'PASS: gate 1 - VPN loss forwards zero requests via the fallback interface.'
     nft delete table inet rk_vpn_proxy
     for attempt in {1..100}; do
         systemctl is-active --quiet "$proxy_unit" || break
@@ -235,14 +244,38 @@ if [[ "$systemd_test" == --systemd ]]; then
         echo 'FAIL: proxy kept running after rule deletion.' >&2
         exit 1
     fi
-    stopped_count=$(wc -l < "$leak_log")
     sleep 1
-    if [[ "$(wc -l < "$leak_log")" != "$stopped_count" ]]; then
-        echo 'FAIL: requests were still forwarded after the proxy stopped.' >&2
-        exit 1
-    fi
     touch "$stop_probes"
     wait "$leak_pid" 2>/dev/null || true
     leak_pid=''
-    printf 'PASS: %s request(s) were forwarded via the fallback interface during the rule-deletion detection window; none after the proxy stopped.\n' "$stopped_count"
+    if [[ -s "$leak_log" ]]; then
+        echo "FAIL: gate 2 - $(wc -l < "$leak_log") request(s) reached the fallback interface after nftables deletion; the policy-routing layer did not hold." >&2
+        exit 1
+    fi
+    echo 'PASS: gate 2 - deleting the whole nftables table still forwards zero requests via the fallback interface.'
 fi
+# The watch daemon must restore deleted policy routing rules on its own.
+ip link set "$VPN_INTERFACE" up
+ip route replace default via 203.0.113.1 dev "$VPN_INTERFACE" metric 50
+if [[ "$systemd_test" == --systemd ]]; then
+    systemctl start "$guard_unit" "$proxy_unit"
+else
+    start_guard
+fi
+proxy_ready=0
+for attempt in {1..50}; do
+    if proxy_probe 2>/dev/null; then proxy_ready=1; break; fi
+    sleep 0.1
+done
+[[ "$proxy_ready" == 1 ]] || { echo 'FAIL: proxy did not restart for the routing self-heal check.' >&2; exit 1; }
+proxy_uid=$(id -u rk-vpn-proxy)
+if ! ip rule del uidrange "$proxy_uid-$proxy_uid" lookup 240 2>/dev/null; then
+    echo 'FAIL: expected a policy routing rule to delete.' >&2; exit 1
+fi
+sleep 2.5
+if ! ip rule show | grep -F "uidrange $proxy_uid-$proxy_uid" | grep -qF 'lookup 240'; then
+    echo 'FAIL: watch daemon did not restore the deleted policy routing rule.' >&2; exit 1
+fi
+bash "$source_dir/scripts/firewall.sh" --check
+proxy_probe
+echo 'PASS: watch daemon restores deleted policy routing rules.'

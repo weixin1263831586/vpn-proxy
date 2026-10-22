@@ -16,7 +16,7 @@ flowchart LR
     subgraph Host[已有 VPN 的代理主机]
         Download[安装脚本下载服务]
         Squid[Squid HTTP 正向代理]
-        Guard[nftables 按代理 UID 限制出站]
+        Guard[nftables + 策略路由双层限制代理 UID 出站]
         Watch[防火墙守护进程]
         VPN[已建立的 VPN 接口]
         Timer[systemd 健康检查定时器]
@@ -24,7 +24,7 @@ flowchart LR
         State[状态文件与 journal]
         Download -. 安装当前用户环境 .-> Env
         Squid --> Guard --> VPN
-        Watch -. 检查规则 .-> Guard
+        Watch -. 检查并自愈规则 .-> Guard
         Watch -. 失败联动停服 .-> Squid
         Timer --> Health --> Squid
         Timer --> State
@@ -53,7 +53,7 @@ flowchart LR
 
 HTTP 请求由 Squid 转发。HTTPS 请求先向 Squid 发送 CONNECT，建立到目标 443 端口的 TCP 隧道，再由客户端与目标站点进行 TLS 握手。项目没有配置 TLS 解密或证书替换，因此 `https_proxy` 仍使用 `http://代理地址:端口`。
 
-`no_proxy` 用于让指定地址绕过代理。安装器保留用户已有条目，加入本机回环地址、所选代理主机，以及配置或参数指定的条目。默认条目中的 RFC1918 CIDR 依赖较新的工具：curl 7.86.0 之前不支持 NO_PROXY 中的 CIDR 写法，旧客户端需把实际内网服务的主机名或 IP 显式加入 `no_proxy`，详见[操作说明](docs/operations.md)。
+`no_proxy` 用于让指定地址绕过代理。安装器保留用户已有条目，加入本机回环地址、所选代理主机，以及配置或参数指定的条目。默认条目除回环和 RFC1918 CIDR 外，已包含已知编译服务器和内网服务的具体地址（`10.10.10.4`、`10.10.10.29`、`10.10.10.206`、`172.16.14.233`、`172.16.14.66`），在旧版 curl 上也生效；内网域名仍需按实际 Gerrit/Git/Redmine 地址补充。CIDR 条目依赖 curl 7.86.0 及以上，详见[操作说明](docs/operations.md)。
 
 此方式只影响使用该代理的应用。脚本不修改客户端默认路由，也不部署系统级流量转发或 NAT；已运行的子进程、其他用户及独立 systemd 任务不会自动继承当前用户的新环境。
 
@@ -75,7 +75,11 @@ Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](script
 
 其余出站流量被拒绝。即在专用 nftables 规则保持生效的情况下，阻止代理经非 VPN 接口出站；规则异常由守护进程检测并触发代理停止。普通 VPN 掉线由内核中的规则直接阻断，即使系统改用普通网卡，代理也不能借用该出口；VPN 接口及正确路由恢复后，新请求可恢复，已经断开的下载仍需客户端重试。
 
-`rk-vpn-proxy-firewall.service` 原子加载规则，确认就绪后才允许代理启动，并每秒对比专用表的完整规则（忽略计数值）。规则缺失或变化时守护进程失败退出，`BindsTo` 联动停止代理；守护进程意外退出也会触发停服。代理每次启动还会复查规则。停止服务保留现有规则，排查后需手动重启防火墙和代理。
+在此之上还有第二层独立于 nftables 的出站约束：`ip rule` 将代理 UID 的路由查找指向专用路由表（默认表 240），该表只提供 `VPN 接口默认路由` 和 `unreachable 兜底`；`allowed_clients` 网段例外，继续查 main 表以沿用管理员的回程路由（含动态路由）。因此即使整个 nftables 表被删除，代理也只能经 VPN 出站或直接不可达，不会回退到普通网卡默认路由。守护进程每秒核对 nftables 规则，并对缺失的策略路由规则和路由（如 pppd 重连重建接口后丢失的设备路由）做幂等自愈。
+
+两层约束各自独立：只删 nftables 表会被策略路由兜底并以零泄漏通过 CI 门禁；只删策略路由规则会被约 1 秒内的自愈恢复，同时 nftables 仍在强制 VPN 出口。理论上同时删除两层才可能产生秒级窗口，这需要特权操作且超出单点故障范畴。
+
+`rk-vpn-proxy-firewall.service` 原子加载 nftables 规则并安装策略路由，确认两层就绪后才允许代理启动，此后每秒对比专用表的完整规则（忽略计数值）并对缺失的策略路由做幂等自愈。nftables 规则缺失或变化时守护进程失败退出，`BindsTo` 联动停止代理；守护进程意外退出也会触发停服。代理每次启动还会复查两层约束（`firewall.sh --check`）。停止服务保留现有规则，排查后需手动重启防火墙和代理；`firewall.sh --cleanup` 供回滚时移除两层规则。
 
 ### 配置生成与健康检查
 
@@ -91,8 +95,8 @@ Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](script
 | --- | --- |
 | 适用于多台客户端、多个用户 | 客户端安装按当前 `HOME` 写入，权限按服务端 CIDR 控制 |
 | 应用接入方便 | 使用常见 HTTP 代理环境变量，支持 HTTPS CONNECT |
-| 出口限制范围明确 | nftables 只对 `rk-vpn-proxy` 用户增加出站限制 |
-| VPN 中断时阻止普通网络回退 | 按实际出站接口放行，其他出口拒绝 |
+| 出口限制范围明确 | nftables 与代理 UID 策略路由双层限制，只作用于 `rk-vpn-proxy` 用户 |
+| VPN 中断时阻止普通网络回退 | 按实际出站接口放行，其他出口拒绝；nftables 表被删除时由策略路由兜底 |
 | 部署参数集中管理 | 配置校验后生成代理、客户端和防火墙运行参数 |
 | 可运维和验证 | systemd 服务、日志轮转、状态探测、配置备份与隔离网络测试 |
 
@@ -101,9 +105,10 @@ Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](script
 - 支持范围是 HTTP/HTTPS 应用代理，不提供全系统隧道、UDP 代理或任意端口的 TCP 转发；部分应用需要另行设置代理。
 - 代理主机和 VPN 是共同依赖。代码不建立 VPN、不实现 VPN 自动重连，也没有多代理节点切换功能。
 - 安装包含公网连通性检查；普通执行失败会尝试恢复部署前的文件、服务及项目 UFW 规则。部署验收以代理 HTTPS 就绪检查为准，安装结束时的首次健康探测只记录状态，失败不触发回滚。已安装软件包、新建账户和日志保留，断电或 SIGKILL 不会执行自动恢复。
-- 访问控制基于来源 IP/CIDR，没有账号密码认证；安装脚本下载服务使用 HTTP，没有配置 HTTPS、签名校验或下载令牌。推荐核对主机密钥后通过 SSH 下载执行；HTTP 一键安装只适用于信任下载链路的环境。
-- 对外部清空规则的检测约有 1 秒轮询间隔，系统调度和代理停服也需要时间。这不能保证特权程序删除规则期间零流量泄漏；普通 VPN 掉线则由内核中的规则直接阻断。
-- 服务端监听、DNS 配置和健康路由探测按 IPv4 实现，没有完整的 IPv6 部署流程。
+- 访问控制基于来源 IP/CIDR，没有账号密码认证；HTTP 安装脚本下载入口默认关闭（`installer_enabled` 默认 false），本仓库为保留一键安装显式开启。该入口使用 HTTP，没有 HTTPS、签名校验或下载令牌，推荐核对主机密钥后通过 SSH 下载执行；HTTP 一键安装只适用于信任下载链路的环境。
+- 出站约束为双层：nftables 规则 + 代理 UID 策略路由。删除整个 nftables 表由策略路由兜底（隔离测试以零泄漏为验收门禁）；删除策略路由规则由守护进程约 1 秒内自愈，期间 nftables 仍在强制 VPN 出口。理论上同时删除两层才可能出现秒级窗口，属于特权操作场景。
+- 代理 UID 的路由查找先于 Tailscale 等其他策略路由生效：代理流量不经 Tailscale 出站；`allowed_clients` 网段必须能经 main 表路由（回程路由需已存在），否则客户端无法连通。
+- 服务端监听、DNS 配置和健康路由探测按 IPv4 实现，第二层策略路由同样按 IPv4 生效，没有完整的 IPv6 部署流程。
 - 健康检查依赖公网探测服务，只记录状态和 IP 变化，不发送外部告警。项目未提供带宽限额、连接配额或性能保证。
 
 ## 使用入口
@@ -160,7 +165,7 @@ python3 -B -m unittest discover -s tests -v
 sudo bash tests/test-killswitch.sh --systemd
 ```
 
-回归测试覆盖配置、客户端、HTTP 下载异常、部署快照恢复及 UFW 规则归属。隔离网络测试实际启动 Squid、加载 nftables，验证 VPN 掉线和恢复、规则修改和删除，以及 systemd 联动停服，并测量删除规则到代理停止期间经备用网卡转发的请求数；不操作真实 VPN。CI 在一次性 Ubuntu 运行器上额外执行真实部署故障注入演练（配置错误升级、apt 下载失败、SIGTERM/SIGKILL 中断恢复与完整回滚），见 [tests/test-deployment-drill.sh](tests/test-deployment-drill.sh)。
+回归测试覆盖配置、客户端、HTTP 下载异常、部署快照恢复及 UFW 规则归属。隔离网络测试实际启动 Squid、加载 nftables 与策略路由，验证 VPN 掉线和恢复、规则修改和删除，以及 systemd 联动停服，并以两道零泄漏门禁验收：VPN 掉线期间、以及删除整个 nftables 表到代理停止期间，经备用网卡转发的请求数都必须为零，否则 CI 失败。CI 在一次性 Ubuntu 运行器上额外执行真实部署故障注入演练（配置错误升级、apt 下载失败、SIGTERM/SIGKILL 中断恢复、禁用安装入口与完整回滚），见 [tests/test-deployment-drill.sh](tests/test-deployment-drill.sh)。
 
 ## 目录与维护职责
 

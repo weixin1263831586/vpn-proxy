@@ -36,7 +36,9 @@ jobs:
       - name: Install real deployment dependencies
         run: sudo apt-get update && sudo apt-get install -y squid nftables iproute2 curl util-linux
       - name: Run fault-injection deployment drill on a real systemd host
-        run: sudo bash tests/test-deployment-drill.sh
+        env:
+          DRILL_CONFIRM_DISPOSABLE: '1'
+        run: sudo --preserve-env=DRILL_CONFIRM_DISPOSABLE bash tests/test-deployment-drill.sh
   windows:
     runs-on: windows-latest
     steps:

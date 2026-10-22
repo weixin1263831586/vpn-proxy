@@ -34,23 +34,27 @@ class InstallerDownloads(unittest.TestCase):
                             self.assertEqual(response.read().decode(), f"client-install.{extension}")
                     with self.assertRaises(HTTPError) as denied_path:
                         opener.open(f"{base}/../config.json")
-                    self.assertEqual(denied_path.exception.code, 404)
+                    with denied_path.exception:
+                        self.assertEqual(denied_path.exception.code, 404)
                     for failure in (ValueError("broken config"), OSError("unreadable config")):
                         with patch.object(DOWNLOADER, "load_config", side_effect=failure), \
                              self.assertLogs(level=logging.ERROR):
                             with self.assertRaises(HTTPError) as unavailable:
                                 opener.open(f"{base}/install.sh")
-                            self.assertEqual(unavailable.exception.code, 503)
+                            with unavailable.exception:
+                                self.assertEqual(unavailable.exception.code, 503)
                     (build / "client-install.ps1").unlink()
                     with self.assertLogs(level=logging.ERROR):
                         with self.assertRaises(HTTPError) as missing_file:
                             opener.open(f"{base}/install.ps1")
-                    self.assertEqual(missing_file.exception.code, 503)
+                    with missing_file.exception:
+                        self.assertEqual(missing_file.exception.code, 503)
                     with patch.object(DOWNLOADER, "client_allowed", return_value=False):
                         for extension in ("sh", "ps1"):
                             with self.assertRaises(HTTPError) as denied_client:
                                 opener.open(f"{base}/install.{extension}")
-                            self.assertEqual(denied_client.exception.code, 403)
+                            with denied_client.exception:
+                                self.assertEqual(denied_client.exception.code, 403)
                 finally:
                     server.shutdown()
                     thread.join()

@@ -6,12 +6,32 @@
 set -euo pipefail
 [[ $EUID == 0 ]] || { echo 'Run with sudo (on a disposable host).' >&2; exit 1; }
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ${DRILL_CONFIRM_DISPOSABLE:-} != 1 ]]; then
+    echo 'This drill removes packages, rewrites APT sources and interrupts services.' >&2
+    echo 'Run it ONLY on a disposable Ubuntu host and confirm with:' >&2
+    echo '    DRILL_CONFIRM_DISPOSABLE=1 sudo -E bash tests/test-deployment-drill.sh' >&2
+    exit 1
+fi
 if [[ -d /etc/rk-vpn-proxy ]] || compgen -G '/etc/systemd/system/rk-vpn-proxy-*' >/dev/null; then
     echo 'Refusing to run: this host already has an rk-vpn-proxy deployment.' >&2
     exit 1
 fi
+# install.sh refuses to migrate a running distribution Squid; stop it and wait.
+for attempt in {1..20}; do
+    systemctl is-active --quiet squid.service || break
+    systemctl stop squid.service 2>/dev/null || true
+    sleep 0.5
+done
+if systemctl is-active --quiet squid.service; then
+    echo 'FAIL: could not stop the distribution squid before drilling.' >&2
+    exit 1
+fi
 drill_dir=$(mktemp -d /tmp/rk-vpn-drill.XXXXXX)
-cleanup() { rm -rf -- "$drill_dir"; }
+cleanup() {
+    rm -rf -- /tmp/rk-vpn-drill-last
+    cp -a -- "$drill_dir" /tmp/rk-vpn-drill-last 2>/dev/null || true
+    rm -rf -- "$drill_dir"
+}
 trap cleanup EXIT
 trap 'echo "DRILL FAILED at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 PROXY_PORT=17901
@@ -32,14 +52,16 @@ write_config() {
   "installer_port": 17903,
   "vpn_interface": "$default_iface",
   "allowed_clients": ["127.0.0.0/8"],
+  "installer_enabled": $3,
   "dns_nameservers": ["$DRILL_DNS"],
   "test_url": "$TEST_URL",
   "no_proxy": ["localhost", "127.0.0.1", "::1"$2]
 }
 EOF
 }
-write_config "$drill_dir/config1.json" ''
-write_config "$drill_dir/config2.json" ', "drill.invalid"'
+write_config "$drill_dir/config1.json" '' true
+write_config "$drill_dir/config2.json" ', "drill.invalid"' true
+write_config "$drill_dir/config3.json" ', "drill.disabled"' false
 forward_ok() {
     curl --silent --fail --noproxy '' --proxy "http://127.0.0.1:$PROXY_PORT" \
         --connect-timeout 5 --max-time 20 --head "$TEST_URL" -o /dev/null
@@ -106,6 +128,10 @@ fi
 run_install "$drill_dir/config1.json" "$drill_dir/install-a.log"
 wait_healthy 'fresh deployment installs and forwards traffic.'
 nft list table inet rk_vpn_proxy >/dev/null
+ip rule show | grep -F "lookup 240" >/dev/null
+ip route show table 240 | grep -F "unreachable" >/dev/null
+systemctl is-active --quiet rk-vpn-proxy-installer.service
+echo 'PASS: nftables and policy-routing constraints installed; HTTP installer enabled.'
 cp /etc/rk-vpn-proxy/config.json "$drill_dir/baseline-config.json"
 cp /etc/rk-vpn-proxy/squid.conf "$drill_dir/baseline-squid.conf"
 if [[ ${DRILL_UFW:-0} == 1 ]] && command -v ufw >/dev/null; then
@@ -183,6 +209,22 @@ clear_dropin
 systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 wait_healthy 'services restart without the drill drop-in.'
 
+echo "== Scenario G: disabling the HTTP installer entry point =="
+run_install "$drill_dir/config3.json" "$drill_dir/install-g.log"
+if systemctl is-active --quiet rk-vpn-proxy-installer.service; then
+    echo 'FAIL: installer service still active after installer_enabled=false.' >&2; exit 1
+fi
+if systemctl is-enabled --quiet rk-vpn-proxy-installer.service; then
+    echo 'FAIL: installer service still enabled after installer_enabled=false.' >&2; exit 1
+fi
+if [[ ${DRILL_UFW:-0} == 1 ]] && command -v ufw >/dev/null; then
+    if ufw show added | grep -Fq 'rk-vpn-installer'; then
+        echo 'FAIL: installer UFW rule left after installer_enabled=false.' >&2; exit 1
+    fi
+fi
+wait_healthy 'proxy keeps working with the HTTP installer entry disabled.'
+echo 'PASS: installer_enabled=false stops and disables the HTTP entry point.'
+
 echo "== Scenario F: rollback removes the deployment =="
 bash "$source_dir/rollback.sh" > "$drill_dir/rollback.log" 2>&1
 [[ ! -e /etc/rk-vpn-proxy && ! -e /usr/local/libexec/rk-vpn-proxy-firewall ]]
@@ -191,6 +233,12 @@ compgen -G '/etc/systemd/system/rk-vpn-proxy-*' >/dev/null && {
 }
 if nft list table inet rk_vpn_proxy >/dev/null 2>&1; then
     echo 'FAIL: dedicated nftables table left after rollback.' >&2; exit 1
+fi
+if ip rule show | grep -Fq 'lookup 240'; then
+    echo 'FAIL: policy routing rules left after rollback.' >&2; exit 1
+fi
+if [[ -n $(ip route show table 240 2>/dev/null) ]]; then
+    echo 'FAIL: policy routing table left after rollback.' >&2; exit 1
 fi
 for unit in rk-vpn-proxy.service rk-vpn-proxy-firewall.service rk-vpn-proxy-installer.service; do
     systemctl is-active --quiet "$unit" && {

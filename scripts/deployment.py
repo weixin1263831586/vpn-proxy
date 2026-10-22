@@ -65,8 +65,10 @@ def sync_ufw(config_path):
         for network in config["allowed_clients"]:
             network = ipaddress.ip_network(network)
             source = str(network.network_address) if network.prefixlen == network.max_prefixlen else str(network)
-            for port, tag in ((config["proxy_port"], "rk-vpn-proxy"),
-                              (config["installer_port"], "rk-vpn-installer")):
+            ports = [(config["proxy_port"], "rk-vpn-proxy")]
+            if config["installer_enabled"]:
+                ports.append((config["installer_port"], "rk-vpn-installer"))
+            for port, tag in ports:
                 desired.append(["allow", "from", source, "to", destination, "port", str(port),
                                 "proto", "tcp", "comment", tag])
     reconcile_ufw(desired)

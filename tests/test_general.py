@@ -32,13 +32,18 @@ class GeneralDeploymentTests(unittest.TestCase):
         config = load_config()
         config.update(listen_host="192.168.50.1", advertise_host="vpn.example.test",
                       proxy_port=8765, health_port=18765, installer_port=8090,
-                      vpn_interface="tun8", allowed_clients=["192.168.50.0/24"])
+                      vpn_interface="tun8", allowed_clients=["192.168.50.0/24"],
+                      installer_enabled=False,
+                      no_proxy=["localhost", "127.0.0.1", "::1", "198.18.0.0/15"])
         outputs = BUILDER.render(config)
         self.assertIn("http_port 192.168.50.1:8765", outputs["squid.conf"])
         self.assertIn("acl allowed_clients src 192.168.50.0/24", outputs["squid.conf"])
         self.assertIn("http://vpn.example.test:8765", outputs["client-install.sh"])
         self.assertIn("http://vpn.example.test:8765", outputs["client-install.ps1"])
+        self.assertIn("198.18.0.0/15", outputs["client-install.sh"])
         self.assertIn("VPN_INTERFACE=tun8", outputs["runtime.env"])
+        self.assertIn("INSTALLER_ENABLED=0", outputs["runtime.env"])
+        self.assertIn("ALLOWED_CLIENTS=192.168.50.0/24", outputs["runtime.env"])
         for content in outputs.values():
             self.assertNotIn("10.10.10.206", content)
             self.assertNotIn("172.16.14.233", content)
@@ -57,7 +62,7 @@ class GeneralDeploymentTests(unittest.TestCase):
                         {"vpn_interface": 'tun0"; reject'}, {"proxy_port": 8089},
                         {"allowed_clients": ["0.0.0.0/0"], "allow_public_clients": True},
                         {"allowed_clients": ["::/0"]}, {"allowed_clients": ["8.8.8.8/32"]},
-                        {"allow_public_clients": "true"}):
+                        {"allow_public_clients": "true"}, {"installer_enabled": "true"}):
             config = copy.deepcopy(load_config())
             config.update(updates)
             with tempfile.TemporaryDirectory() as directory:
@@ -73,6 +78,17 @@ class GeneralDeploymentTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(config))
             self.assertEqual(load_config(path)["allowed_clients"], ["8.8.8.8/32"])
+
+    def test_installer_entry_defaults_to_disabled(self):
+        config = load_config()
+        self.assertTrue(config["installer_enabled"])  # this repository explicitly opts in
+        del config["installer_enabled"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+            self.assertFalse(loaded["installer_enabled"])
+            self.assertIn("INSTALLER_ENABLED=0", BUILDER.render(loaded)["runtime.env"])
 
     def test_installer_arbitrary_user_home_override_and_idempotency(self):
         with tempfile.TemporaryDirectory() as directory:

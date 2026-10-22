@@ -106,7 +106,12 @@ cat > /etc/logrotate.d/rk-vpn-proxy <<'EOF'
 EOF
 runuser -u rk-vpn-proxy -- squid -k parse -f /etc/rk-vpn-proxy/squid.conf
 systemctl daemon-reload
-systemctl enable rk-vpn-proxy-firewall.service rk-vpn-proxy.service rk-vpn-proxy-health.timer rk-vpn-proxy-installer.service
+systemctl enable rk-vpn-proxy-firewall.service rk-vpn-proxy.service rk-vpn-proxy-health.timer
+if [[ "$INSTALLER_ENABLED" == 1 ]]; then
+    systemctl enable rk-vpn-proxy-installer.service
+else
+    systemctl disable rk-vpn-proxy-installer.service 2>/dev/null || true
+fi
 systemctl restart rk-vpn-proxy-firewall.service
 systemctl restart rk-vpn-proxy.service
 ready=0
@@ -120,21 +125,26 @@ for attempt in {1..10}; do
 done
 [[ $ready == 1 ]] || { echo 'Proxy failed the HTTPS readiness check.' >&2; false; }
 LC_ALL=C python3 -B "$source_dir/scripts/deployment.py" ufw-sync "$config_path"
-systemctl restart rk-vpn-proxy-installer.service
-installer_host=$PROXY_BIND_ADDRESS
-[[ "$installer_host" != 0.0.0.0 ]] || installer_host=127.0.0.1
-download_ready=0
-for attempt in {1..5}; do
-    # Use a loopback source so restrictive client ACLs need no host-IP exception.
-    if curl --silent --fail --noproxy '*' --interface 127.0.0.1 --max-time 3 \
-        "http://$installer_host:$INSTALLER_PORT/install.sh" -o "$build_dir/download-check" &&
-        cmp -s "$build_dir/download-check" "$build_dir/client-install.sh"; then
-        download_ready=1
-        break
-    fi
-    sleep 1
-done
-[[ $download_ready == 1 ]] || { echo 'Installer failed the download readiness check.' >&2; false; }
+if [[ "$INSTALLER_ENABLED" == 1 ]]; then
+    systemctl restart rk-vpn-proxy-installer.service
+    installer_host=$PROXY_BIND_ADDRESS
+    [[ "$installer_host" != 0.0.0.0 ]] || installer_host=127.0.0.1
+    download_ready=0
+    for attempt in {1..5}; do
+        # Use a loopback source so restrictive client ACLs need no host-IP exception.
+        if curl --silent --fail --noproxy '*' --interface 127.0.0.1 --max-time 3 \
+            "http://$installer_host:$INSTALLER_PORT/install.sh" -o "$build_dir/download-check" &&
+            cmp -s "$build_dir/download-check" "$build_dir/client-install.sh"; then
+            download_ready=1
+            break
+        fi
+        sleep 1
+    done
+    [[ $download_ready == 1 ]] || { echo 'Installer failed the download readiness check.' >&2; false; }
+else
+    systemctl stop rk-vpn-proxy-installer.service 2>/dev/null || true
+    echo 'HTTP installer entry point disabled (installer_enabled=false).'
+fi
 systemctl restart rk-vpn-proxy-health.timer
 # The deployment verdict is the proxy HTTPS and installer readiness checks above.
 # The first health probe only records state; an external IP service outage must
