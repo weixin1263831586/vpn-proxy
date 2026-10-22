@@ -18,9 +18,11 @@ SPEC.loader.exec_module(BUILDER)
 class GeneralDeploymentTests(unittest.TestCase):
     def test_private_networks_and_public_denial(self):
         config = load_config()
-        for address in ("10.2.3.4", "172.20.8.9", "192.168.8.20"):
+        # The shipped default explicitly authorizes only the known compile servers.
+        for address in ("10.10.10.206", "172.16.14.66"):
             self.assertTrue(client_allowed(address, config))
-        self.assertFalse(client_allowed("203.0.113.8", config))
+        for address in ("10.10.10.207", "172.16.14.67", "192.168.8.20", "203.0.113.8"):
+            self.assertFalse(client_allowed(address, config))
         config["allowed_clients"] = ["192.168.8.0/24"]
         self.assertTrue(client_allowed("192.168.8.70", config))
         self.assertFalse(client_allowed("192.168.9.70", config))

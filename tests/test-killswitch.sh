@@ -14,6 +14,7 @@ server_pid=''
 http_pid=''
 guard_pid=''
 proxy_pid=''
+leak_pid=''
 systemd_test=${2:-}
 guard_unit="rk-vpn-test-$$-guard.service"
 proxy_unit="rk-vpn-test-$$-proxy.service"
@@ -33,6 +34,10 @@ cleanup() {
     if [[ -n "$guard_pid" ]]; then
         kill "$guard_pid" 2>/dev/null || true
         wait "$guard_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$leak_pid" ]]; then
+        kill "$leak_pid" 2>/dev/null || true
+        wait "$leak_pid" 2>/dev/null || true
     fi
     [[ -z "$http_pid" ]] || kill "$http_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
@@ -187,3 +192,57 @@ done
 nft delete table inet rk_vpn_proxy
 assert_guard_failed
 echo 'PASS: missing firewall table fails the guard.'
+if [[ "$systemd_test" == --systemd ]]; then
+    # Measure the detection window: how many requests Squid still forwards via
+    # the fallback interface between rule deletion and the guard-triggered stop.
+    systemctl start "$guard_unit" "$proxy_unit"
+    leak_ready=0
+    for attempt in {1..50}; do
+        if proxy_probe 2>/dev/null; then leak_ready=1; break; fi
+        sleep 0.1
+    done
+    [[ "$leak_ready" == 1 ]] || { echo 'FAIL: proxy did not restart for the leak measurement.' >&2; exit 1; }
+    ip link set "$VPN_INTERFACE" down
+    ip route get 1.1.1.1 | grep -F "dev $fallback_interface"
+    blocked=0
+    for attempt in {1..30}; do
+        if ! proxy_probe 2>/dev/null; then blocked=1; break; fi
+        sleep 0.1
+    done
+    [[ "$blocked" == 1 ]] || { echo 'FAIL: proxy forwarded via the fallback while rules were intact.' >&2; exit 1; }
+    stop_probes="$test_dir/stop-probes"
+    leak_log="$test_dir/leak-count"
+    rm -f -- "$stop_probes" "$leak_log"
+    : > "$leak_log"
+    probe_leaks() {
+        while [[ ! -f "$stop_probes" ]]; do
+            if proxy_probe 2>/dev/null; then printf 'x\n' >> "$leak_log"; fi
+        done
+    }
+    probe_leaks &
+    leak_pid=$!
+    sleep 0.5
+    if [[ -s "$leak_log" ]]; then
+        echo 'FAIL: requests were forwarded via the fallback while rules were intact.' >&2
+        exit 1
+    fi
+    nft delete table inet rk_vpn_proxy
+    for attempt in {1..100}; do
+        systemctl is-active --quiet "$proxy_unit" || break
+        sleep 0.05
+    done
+    if systemctl is-active --quiet "$proxy_unit"; then
+        echo 'FAIL: proxy kept running after rule deletion.' >&2
+        exit 1
+    fi
+    stopped_count=$(wc -l < "$leak_log")
+    sleep 1
+    if [[ "$(wc -l < "$leak_log")" != "$stopped_count" ]]; then
+        echo 'FAIL: requests were still forwarded after the proxy stopped.' >&2
+        exit 1
+    fi
+    touch "$stop_probes"
+    wait "$leak_pid" 2>/dev/null || true
+    leak_pid=''
+    printf 'PASS: %s request(s) were forwarded via the fallback interface during the rule-deletion detection window; none after the proxy stopped.\n' "$stopped_count"
+fi

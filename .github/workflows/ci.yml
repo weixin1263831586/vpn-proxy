@@ -29,6 +29,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y squid nftables iproute2 curl
       - name: Parse Squid and exercise actual firewall and VPN fallback
         run: sudo bash tests/test-killswitch.sh --systemd
+  deployment-drill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install real deployment dependencies
+        run: sudo apt-get update && sudo apt-get install -y squid nftables iproute2 curl util-linux
+      - name: Run fault-injection deployment drill on a real systemd host
+        run: sudo bash tests/test-deployment-drill.sh
   windows:
     runs-on: windows-latest
     steps:

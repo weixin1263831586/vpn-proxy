@@ -136,7 +136,12 @@ for attempt in {1..5}; do
 done
 [[ $download_ready == 1 ]] || { echo 'Installer failed the download readiness check.' >&2; false; }
 systemctl restart rk-vpn-proxy-health.timer
-systemctl start rk-vpn-proxy-health.service
+# The deployment verdict is the proxy HTTPS and installer readiness checks above.
+# The first health probe only records state; an external IP service outage must
+# not roll back a deployment that already passed acceptance.
+if ! systemctl start rk-vpn-proxy-health.service; then
+    echo 'Warning: first health probe failed; deployment checks already passed. See journalctl -u rk-vpn-proxy-health.service.' >&2
+fi
 systemctl --no-pager --full status rk-vpn-proxy.service
 if [[ ! -d "$deploy_state/original" ]]; then
     cp -a -- "$transaction" "$deploy_state/original.tmp.$$"
