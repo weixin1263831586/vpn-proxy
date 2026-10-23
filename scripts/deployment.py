@@ -128,6 +128,15 @@ def policy_routes(family):
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def matches_selector(rule, selector):
+    return f" {selector} " in f" {rule} "
+
+
+def owned_policy_rule(rule, selector):
+    return matches_selector(rule, selector) and any(
+        matches_selector(rule, lookup) for lookup in POLICY_LOOKUPS)
+
+
 def snapshot_policy_routing():
     """Record the policy-routing state so a failed first install restores it."""
     state = {"rules": [], "routes": []}
@@ -137,7 +146,7 @@ def snapshot_policy_routing():
         return state
     for family in (4, 6):
         for pref, rest in policy_rules(family):
-            if selector in rest and any(f" {lookup}" in f" {rest}" for lookup in POLICY_LOOKUPS):
+            if owned_policy_rule(rest, selector):
                 state["rules"].append({"family": family, "pref": pref, "rule": rest})
         for route in policy_routes(family):
             state["routes"].append({"family": family, "route": route})
@@ -156,7 +165,7 @@ def restore_policy_routing(saved):
     for family in (4, 6):
         for _ in range(3):
             doomed = [(pref, rest) for pref, rest in policy_rules(family)
-                      if selector in rest and any(f" {lookup}" in f" {rest}" for lookup in POLICY_LOOKUPS)
+                      if owned_policy_rule(rest, selector)
                       and (family, pref, rest) not in saved_rules]
             if not doomed:
                 break
@@ -169,7 +178,7 @@ def restore_policy_routing(saved):
 
     def current_policy():
         rules = {(family, pref, rest) for family in (4, 6)
-                 for pref, rest in policy_rules(family) if selector in rest}
+                 for pref, rest in policy_rules(family) if matches_selector(rest, selector)}
         routes = {(family, route) for family in (4, 6) for route in policy_routes(family)}
         return rules, routes
 
@@ -180,8 +189,7 @@ def restore_policy_routing(saved):
         run("ip", f"-{family}", "route", "add", *shlex.split(route),
             "table", ROUTING_TABLE, check=False)
     rules, routes = current_policy()
-    ours_rules = {entry for entry in rules
-                  if any(f" {lookup}" in f" {entry[2]}" for lookup in POLICY_LOOKUPS)}
+    ours_rules = {entry for entry in rules if owned_policy_rule(entry[2], selector)}
     if ours_rules != saved_rules:
         raise RuntimeError(f"policy-routing rules did not return to the snapshot state: "
                            f"leftover={sorted(ours_rules - saved_rules)} missing={sorted(saved_rules - ours_rules)}")
@@ -190,6 +198,9 @@ def restore_policy_routing(saved):
     if leftover_routes:
         raise RuntimeError(f"routing table {ROUTING_TABLE} still contains project routes "
                            f"after restore: {sorted(leftover_routes)}")
+    if saved_routes - routes:
+        raise RuntimeError(f"routing table {ROUTING_TABLE} is missing snapshot routes "
+                           f"after restore: {sorted(saved_routes - routes)}")
 
 
 def snapshot(directory):

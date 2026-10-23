@@ -1,6 +1,6 @@
 # 操作说明
 
-原理、架构和限制见 [README](../README.md)。
+快速使用见 [README](../README.md)，出口保护原理与边界见[架构说明](architecture.md)。
 
 ## 部署服务端
 
@@ -23,6 +23,8 @@
 | `test_url` | 客户端安装时验证的 HTTPS 地址 |
 | `no_proxy` | 合并进客户端 `no_proxy` 的默认条目 |
 
+配置顶层必须是 JSON 对象；地址、接口和测试 URL 必须是字符串，`allowed_clients`、`dns_nameservers`、`no_proxy` 必须是字符串数组。客户端网段会规范化并去重；测试 URL 必须使用 HTTPS，不能包含账号密码、空白或控制字符，端口须有效。
+
 默认白名单只显式授权当前已知的编译服务器：`10.10.10.206/32`、`172.16.14.66/32`。新增客户端时应修改 `allowed_clients` 显式列出其地址或网段，不要直接放开整个 RFC1918。公网来源需显式开启，默认拒绝；`0.0.0.0/0`、`::/0` 始终被拒绝。若确需支持多个办公网段，使用类似下面的部署示例（不是默认策略，仍应按实际授权范围收窄）：
 
 ```json
@@ -30,6 +32,8 @@
 ```
 
 代理与安装脚本下载服务目前共用这一份来源白名单；需要更细的区分时应单独评估。HTTP 下载入口默认关闭（`installer_enabled` 默认 false），需要一键安装的部署应显式设置为 true；关闭时安装器会停用并禁用下载服务，UFW 也不再放行下载端口。
+
+下载服务在每次请求时重新检查启用开关和来源白名单；关闭开关后即使进程尚未停止，也会拒绝下载。服务最多同时处理 32 个连接，超额连接直接关闭；单次套接字读写的空闲超时为 10 秒。
 
 ```bash
 cd /path/to/vpn-proxy
@@ -87,7 +91,7 @@ source "$tmp" http://proxy.example.internal:7897
 export RK_VPN_NO_PROXY=git.internal,redmine.internal
 ```
 
-HTTPS 代理探测要求 CONNECT 成功且目标返回 2xx 或 3xx。探测失败不会覆盖持久配置。环境文件为 `~/.config/rk-vpn-proxy/env.sh`（0600），配置及备份目录为 0700。生成的环境脚本仅在 Bash 中加载，避免影响使用 `.profile` 的 POSIX Shell。备份位于同目录的 `backups/`。安装器在 `.bashrc`、`.profile` 和已存在的优先登录入口中添加加载块，重复执行不会重复添加。
+HTTPS 代理探测要求 CONNECT 成功、TLS 验证结果为 0，且目标返回 2xx 或 3xx。探测失败不会覆盖持久配置。环境文件为 `~/.config/rk-vpn-proxy/env.sh`（0600），配置及备份目录为 0700。生成的环境脚本仅在 Bash 中加载，避免影响使用 `.profile` 的 POSIX Shell。备份位于同目录的 `backups/`。安装器在 `.bashrc`、`.profile` 和已存在的优先登录入口中添加加载块，重复执行不会重复添加。
 
 使用 `source` 可让当前终端生效。不希望影响当前终端时，也可以把下载好的临时文件交给子 Shell 执行（`bash "$tmp"`），只对安装子进程及后续新终端生效；不要使用 `curl ... | bash`，管道会掩盖下载失败的退出码。已有终端也可手动加载：
 
@@ -208,12 +212,15 @@ sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 python3 -m unittest discover -s tests -v
 bash check-client.sh
 bash tests/test_policy_routing.sh
+bash tests/test_policy_routing_kernel.sh
 sudo bash tests/test-killswitch.sh --systemd
 ```
 
 `check-client.sh` 可传入代理 URL，分别检查 Google、Android 下载/源码站和 GitHub 的 CONNECT、TLS 验证和 HTTP 响应，并汇总退出状态。目标网站返回 400、403 等有效 HTTP 响应不直接视为代理失败；安装器的单个测试 URL 则要求 2xx/3xx。
 
 `tests/test_policy_routing.sh` 用桩 `ip`/`nft`（无需 root）回归策略路由第二层的资源管理逻辑：优先级动态分配跳过系统已有规则（2/11/20 个客户端网段不冲突、不反超兜底规则）、部署前资源独占检查拒绝外来占用、清理只删除本项目所有权签名的规则与路由、守护进程自愈被删规则并重排被挤到后面的兜底规则、修复持续失败时清除 `FIREWALL_ENFORCED` 标记、`--check` 校验规则与配置严格一致。
+
+`tests/test_policy_routing_kernel.sh` 在独立网络命名空间中使用真实 `ip` 和 `nft`，验证 `/32`、`/128` 主机选择器的内核输出、IPv4/IPv6 独立的规则优先级、VPN 接口消失后的不可达保护及清理。无需修改主机账户；普通用户运行需要启用用户命名空间，也可用 `sudo bash tests/test_policy_routing_kernel.sh`。CI 在 Linux 集成任务中运行此测试。
 
 `tests/test-killswitch.sh` 使用源码和临时配置，在独立网络命名空间启动真实 Squid，模拟 VPN 正常、掉线、恢复及专用规则损坏。它以 11 个客户端网段验证策略路由优先级的分配与顺序（客户端回程规则互不冲突且始终先于兜底规则），并验证代理 UID 在存在备用 IPv6 默认路由时没有任何 IPv6 出口（含删除 nftables 表之后）。`--systemd` 额外创建临时测试单元，并以高频请求执行两道零泄漏验收门禁（任何非零计数直接判失败）：门禁 1 为 VPN 正常掉线期间经备用网卡转发必须为零；门禁 2 为删除整个 nftables 表到代理被 systemd 停止期间仍必须为零（由第二层策略路由兜底）。测试还验证守护进程会在约 1 秒内自愈被删除的策略路由规则，以及 VPN 接口整体删除后以新地址、新网关重建时镜像路由自动恢复。门禁结论限于该隔离命名空间内的 IPv4 测试流量。结束时清理单元和临时文件。测试无需预先部署，首次测试可能创建代理系统用户；不会修改正式配置或操作真实 VPN。
 

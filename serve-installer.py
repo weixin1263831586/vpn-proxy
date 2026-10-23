@@ -3,6 +3,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import logging
+import threading
 from configuration import client_allowed, load_config
 
 BUILD_DIRECTORY = Path(__file__).parent / "build"
@@ -12,10 +13,39 @@ INSTALLERS = {
 }
 
 
+class InstallerServer(ThreadingHTTPServer):
+    """Bound concurrent connections, including clients that never send headers."""
+
+    max_connections = 32
+    connection_timeout = 10
+
+    def __init__(self, *args, **kwargs):
+        self.connection_slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            request.settimeout(self.connection_timeout)
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
-            allowed = client_allowed(self.client_address[0], load_config())
+            config = load_config()
+            allowed = config["installer_enabled"] and client_allowed(self.client_address[0], config)
         except (OSError, ValueError, KeyError, TypeError):
             logging.exception("Cannot load installer access policy")
             self.send_error(503, "Installer configuration unavailable")
@@ -43,4 +73,4 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     config = load_config()
-    ThreadingHTTPServer((config["listen_host"], config["installer_port"]), Handler).serve_forever()
+    InstallerServer((config["listen_host"], config["installer_port"]), Handler).serve_forever()

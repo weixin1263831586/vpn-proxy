@@ -10,11 +10,20 @@ from urllib.parse import urlsplit
 def load_config(path=None):
     path = path or os.environ.get("RK_VPN_PROXY_CONFIG") or Path(__file__).with_name("config.json")
     config = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be a JSON object")
+    for key in ("listen_host", "advertise_host", "vpn_interface", "test_url"):
+        if not isinstance(config.get(key), str) or not config[key]:
+            raise ValueError(f"{key} must be a non-empty string")
+    for key in ("allowed_clients", "dns_nameservers", "no_proxy"):
+        if not isinstance(config.get(key), list) or any(
+                not isinstance(value, str) or not value for value in config[key]):
+            raise ValueError(f"{key} must be a list of non-empty strings")
     ipaddress.IPv4Address(config["listen_host"])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", config["advertise_host"]):
         raise ValueError("advertise_host must be an IPv4 address or hostname")
     for key in ("proxy_port", "health_port", "installer_port"):
-        if type(config[key]) is not int or not 1 <= config[key] <= 65535:
+        if type(config.get(key)) is not int or not 1 <= config[key] <= 65535:
             raise ValueError(f"Invalid {key}")
     if len({config[key] for key in ("proxy_port", "health_port", "installer_port")}) != 3:
         raise ValueError("Proxy, health and installer ports must differ")
@@ -36,15 +45,19 @@ def load_config(path=None):
                 network.version == private.version and network.subnet_of(private)
                 for private in private_ranges):
             raise ValueError("Public client networks require allow_public_clients=true")
-    config["allowed_clients"] = [str(network) for network in networks]
+    config["allowed_clients"] = list(dict.fromkeys(str(network) for network in networks))
     config["installer_enabled"] = config.get("installer_enabled", False)
     for address in config["dns_nameservers"]:
         ipaddress.IPv4Address(address)
     if not config["dns_nameservers"]:
         raise ValueError("Configure at least one DNS nameserver")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in config["test_url"]):
+        raise ValueError("test_url must not contain whitespace or control characters")
     url = urlsplit(config["test_url"])
-    if url.scheme != "https" or not url.hostname:
+    if url.scheme != "https" or not url.hostname or url.username is not None:
         raise ValueError("test_url must be an HTTPS URL")
+    if url.port is not None and not 1 <= url.port <= 65535:
+        raise ValueError("test_url has an invalid port")
     if any(not isinstance(host, str) or any(char.isspace() for char in host) or "," in host
            for host in config["no_proxy"]):
         raise ValueError("no_proxy must contain individual hosts or networks")

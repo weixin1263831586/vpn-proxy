@@ -204,16 +204,46 @@ class PolicyRoutingRecovery(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not return to the snapshot state"):
                 DEPLOY.restore_policy_routing({"rules": [], "routes": []})
 
+    def test_similar_uid_ranges_and_table_numbers_are_not_owned(self):
+        foreign = ["80: from all uidrange 149-1490 lookup main",
+                   "81: from all uidrange 149-149 lookup 2400"]
+        state = {"rules4": foreign.copy(), "routes4": [], "rules6": [], "routes6": []}
+        run, which = self.apply_patches(state)
+        with run, which:
+            self.assertEqual(DEPLOY.snapshot_policy_routing()["rules"], [])
+            DEPLOY.restore_policy_routing({"rules": [], "routes": []})
+        self.assertEqual(state["rules4"], foreign)
+
+    def test_restore_fails_when_snapshot_route_cannot_be_added(self):
+        state = {"rules4": [], "routes4": [], "rules6": [], "routes6": []}
+        saved = {"rules": [], "routes": [{"family": 4, "route": "unreachable default metric 200"}]}
+        command = self.fake_run_factory(state)
+
+        def fail_add(*args, **kwargs):
+            if args[:4] == ("ip", "-4", "route", "add"):
+                return subprocess.CompletedProcess(args, 2, "", "injected failure")
+            return command(*args, **kwargs)
+
+        with patch.object(DEPLOY, "run", side_effect=fail_add), \
+             patch.object(DEPLOY.shutil, "which", return_value="ip"):
+            with self.assertRaisesRegex(RuntimeError, "missing snapshot routes"):
+                DEPLOY.restore_policy_routing(saved)
+
 
 class HealthState(unittest.TestCase):
     def test_health_separates_firewall_vpn_and_proxy_and_checks_marker_freshness(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "bin").mkdir()
+            identity = root / "bin/id"
+            identity.write_text('#!/bin/bash\necho 149\n')
+            identity.chmod(0o755)
             ip = root / "bin/ip"
             ip.write_text('#!/bin/bash\nif [[ "$*" == *address* ]]; then\n'
                           '  [[ ${TEST_VPN_DOWN:-0} == 0 ]] && echo "inet 203.0.113.2/24"\n'
-                          'else echo "8.8.8.8 dev tun-test src 203.0.113.2"; fi\n')
+                          'elif [[ "$*" == *"uid 149"* ]]; then\n'
+                          '  echo "8.8.8.8 dev tun-test src 203.0.113.2"\n'
+                          'else echo "8.8.8.8 dev eth0 src 192.0.2.2"; fi\n')
             curl = root / "bin/curl"
             curl.write_text('#!/bin/bash\ntouch "$RK_VPN_STATE_DIR/probed"\n'
                             'if [[ ${TEST_LOSE_FIREWALL:-0} == 1 ]]; then rm -f "$RK_VPN_FIREWALL_STATE/enforced"; fi\n'

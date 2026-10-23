@@ -20,9 +20,9 @@ echo "Checking proxy: $proxy"
 probe=$(curl --silent --show-error --fail --noproxy '' --proxy "$proxy" \
     --connect-timeout 20 --max-time 45 --retry 2 --retry-delay 2 \
     --retry-max-time 90 --retry-connrefused --head --output /dev/null \
-    --write-out '%{http_connect} %{http_code}' "$RK_VPN_INSTALL_TEST_URL")
-read -r connect_status http_status <<< "$probe"
-[[ "$connect_status" == 200 && "$http_status" =~ ^[23][0-9][0-9]$ ]] || {
+    --write-out '%{http_connect} %{http_code} %{ssl_verify_result}' "$RK_VPN_INSTALL_TEST_URL")
+read -r connect_status http_status tls_status <<< "$probe"
+[[ "$connect_status" == 200 && "$http_status" =~ ^[23][0-9][0-9]$ && "$tls_status" == 0 ]] || {
     printf 'HTTPS proxy check failed: %s\n' "$probe" >&2
     exit 1
 }

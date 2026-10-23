@@ -79,6 +79,29 @@ class GeneralDeploymentTests(unittest.TestCase):
             path.write_text(json.dumps(config))
             self.assertEqual(load_config(path)["allowed_clients"], ["8.8.8.8/32"])
 
+    def test_config_rejects_wrong_types_and_invalid_test_urls(self):
+        for updates in ({"no_proxy": "localhost"}, {"allowed_clients": {}},
+                        {"dns_nameservers": [134744072]}, {"listen_host": 123},
+                        {"proxy_port": None}, {"test_url": "https://example.org:bad"},
+                        {"test_url": "https://example.org:0"},
+                        {"test_url": "https://example.org/\npath"},
+                        {"test_url": "https://user:secret@example.org"}):
+            with self.subTest(updates=updates), tempfile.TemporaryDirectory() as directory:
+                config = load_config()
+                config.update(updates)
+                path = Path(directory) / "config.json"
+                path.write_text(json.dumps(config))
+                with self.assertRaises(ValueError):
+                    load_config(path)
+
+    def test_duplicate_client_networks_are_normalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config()
+            config["allowed_clients"] = ["10.1.2.3/24", "10.1.2.0/24", "10.2.0.1"]
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config))
+            self.assertEqual(load_config(path)["allowed_clients"], ["10.1.2.0/24", "10.2.0.1/32"])
+
     def test_installer_entry_defaults_to_disabled(self):
         config = load_config()
         self.assertTrue(config["installer_enabled"])  # this repository explicitly opts in
@@ -95,7 +118,7 @@ class GeneralDeploymentTests(unittest.TestCase):
             root = Path(directory)
             (root / "bin").mkdir()
             curl = root / "bin/curl"
-            curl.write_text('#!/bin/bash\ncase " $* " in *" --write-out "*) printf "200 200";; *) printf "HTTP/2 200\\n";; esac\n')
+            curl.write_text('#!/bin/bash\ncase " $* " in *" --write-out "*) printf "200 200 0";; *) printf "HTTP/2 200\\n";; esac\n')
             curl.chmod(0o755)
             installer = root / "install.sh"
             installer.write_text(BUILDER.render(load_config())["client-install.sh"])
@@ -123,6 +146,28 @@ class GeneralDeploymentTests(unittest.TestCase):
                                        env=env, capture_output=True, text=True)
                 self.assertEqual(posix.returncode, 0, posix.stderr)
                 self.assertEqual(posix.stderr, "")
+
+    def test_installer_rejects_failed_tls_before_changing_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bin").mkdir()
+            home = root / "home"
+            home.mkdir()
+            startup = home / ".bashrc"
+            startup.write_text("# original settings\n")
+            curl = root / "bin/curl"
+            # curl may exit successfully with insecure verification enabled
+            # in the user's curlrc; the certificate result must still be checked.
+            curl.write_text('#!/bin/bash\nprintf "200 200 60"\n')
+            curl.chmod(0o755)
+            installer = root / "install.sh"
+            installer.write_text(BUILDER.render(load_config())["client-install.sh"])
+            env = dict(os.environ, HOME=str(home), PATH=f"{root / 'bin'}:{os.environ['PATH']}")
+            result = subprocess.run(["bash", str(installer)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("HTTPS proxy check failed", result.stderr)
+            self.assertEqual(startup.read_text(), "# original settings\n")
+            self.assertFalse((home / ".config/rk-vpn-proxy").exists())
 
 
 if __name__ == "__main__":

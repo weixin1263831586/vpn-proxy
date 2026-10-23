@@ -31,6 +31,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y squid nftables iproute2 curl
       - name: Parse Squid and exercise actual firewall and VPN fallback
         run: sudo bash tests/test-killswitch.sh --systemd
+      - name: Verify host selectors and IPv6 policy ordering against the kernel
+        run: sudo bash tests/test_policy_routing_kernel.sh
   deployment-drill:
     runs-on: ubuntu-latest
     steps:

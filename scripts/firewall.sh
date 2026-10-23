@@ -47,15 +47,18 @@ family_rules() { ip "-$1" rule show 2>/dev/null || true; }
 family_available() { ip "-$1" rule show >/dev/null 2>&1; }
 owned_rules() {
     [[ -n "$uid_selector" ]] || return 0
-    family_rules "$1" | grep -F "$uid_selector" || true
+    family_rules "$1" | grep -F " $uid_selector " || true
 }
 
 client_networks_for_family() {
     local family=$1 network
     for network in ${ALLOWED_CLIENTS:-}; do
+        # ip rule show omits the full prefix for host selectors.
         if [[ "$network" == *:* ]]; then
+            network=${network%/128}
             if [[ "$family" == 6 ]]; then printf '%s\n' "$network"; fi
         else
+            network=${network%/32}
             if [[ "$family" == 4 ]]; then printf '%s\n' "$network"; fi
         fi
     done
@@ -220,9 +223,13 @@ check_policy_routing() {
     # rule using the proxy UID. A VPN default route must be mirrored into
     # the table; while the VPN is down, only the unreachable fallback is
     # required (fail-closed).
-    local family network line pref rest base_pref='' base_count mirrored
+    local family network line pref rest base_pref base_count mirrored
     for family in 4 6; do
-        family_available "$family" || continue
+        if ! family_available "$family"; then
+            [[ "$family" == 6 ]] && continue
+            return 1
+        fi
+        base_pref=''
         base_count=0
         while read -r line; do
             [[ -z "$line" ]] && continue
@@ -265,8 +272,8 @@ precheck_policy_routing() {
         while read -r line; do
             [[ -z "$line" ]] && continue
             rest=${line#*:}
-            if [[ -z "$uid_selector" || "$rest" != *"$uid_selector"* ]]; then
-                if [[ "$rest" == *"lookup $routing_table"* ]]; then
+            if [[ -z "$uid_selector" || " $rest " != *" $uid_selector "* ]]; then
+                if [[ " $rest " == *" lookup $routing_table "* ]]; then
                     echo "firewall.sh: routing table $routing_table is referenced by a rule this project does not own: $line" >&2
                     problems=1
                 fi

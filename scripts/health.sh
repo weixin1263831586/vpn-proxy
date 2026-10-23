@@ -14,7 +14,10 @@ log_change() {
 }
 vpn_up=0 route_ok=0 firewall_enforced=0 proxy_reachable=0
 ip -4 address show dev "$VPN_INTERFACE" 2>/dev/null | grep -q 'inet ' && vpn_up=1
-ip -4 route get "$DNS_CHECK_ADDRESS" 2>/dev/null | grep -Fq "dev $VPN_INTERFACE " && route_ok=1
+# Evaluate the same UID policy routing as Squid, not the health account's
+# main-table route (which may legitimately use a different default).
+proxy_uid=$(id -u rk-vpn-proxy)
+ip -4 route get "$DNS_CHECK_ADDRESS" uid "$proxy_uid" 2>/dev/null | grep -Fq "dev $VPN_INTERFACE " && route_ok=1
 check_firewall() {
     local checked now
     firewall_enforced=0

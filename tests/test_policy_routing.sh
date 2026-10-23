@@ -33,7 +33,10 @@ case "$cmd" in
                 pref='' to='' rest=''
                 while [[ $# -gt 0 ]]; do
                     if [[ $1 == pref && -z "$pref" ]]; then pref=$2; shift 2
-                    elif [[ $1 == to && -z "$to" ]]; then to=$2; shift 2
+                    elif [[ $1 == to && -z "$to" ]]; then
+                        to=$2
+                        if [[ "$to" == *:* ]]; then to=${to%/128}; else to=${to%/32}; fi
+                        shift 2
                     else rest+="$1 "; shift; fi
                 done
                 rest=${rest% }
@@ -299,5 +302,25 @@ assert_invariants 2
 grep -qF 'to 10.3.0.0/24 uidrange 149-149 lookup main' "$S/rules4" && fail 'stale client rule survived watch'
 fw --check
 echo 'PASS: check verifies preference order and configuration match; watch drops stale rules.'
+
+echo '== host selectors and per-family ordering =='
+write_runtime '10.10.10.206/32 fd00::1/128 fd01::/32'
+RK_VPN_WATCH_ITERATIONS=1 fw --watch
+fw --check
+grep -qF 'to 10.10.10.206 uidrange 149-149 lookup main' "$S/rules4" || fail 'IPv4 host selector missing'
+grep -qF 'to fd00::1 uidrange 149-149 lookup main' "$S/rules6" || fail 'IPv6 host selector missing'
+grep -qF 'to fd01::/32 uidrange 149-149 lookup main' "$S/rules6" || fail 'IPv6 /32 was shortened'
+sed -i 's/^[0-9]*: from all uidrange 149-149 lookup 240/89: from all uidrange 149-149 lookup 240/' "$S/rules6"
+if fw --check; then fail 'check accepted IPv6 egress before client rules'; fi
+echo 'PASS: host selectors normalize; IPv6 ordering checked independently.'
+
+echo '== ownership matches complete UID and lookup tokens =='
+fw --cleanup-routing
+printf '81: from all uidrange 149-1490 lookup main\n82: from all lookup 2400\n' > "$S/rules4"
+fw --precheck
+fw --cleanup-routing
+grep -qxF '81: from all uidrange 149-1490 lookup main' "$S/rules4" || fail 'deleted another UID range'
+grep -qxF '82: from all lookup 2400' "$S/rules4" || fail 'deleted another table lookup'
+echo 'PASS: similarly prefixed UID ranges and table numbers are preserved.'
 
 echo 'ALL POLICY-ROUTING STUB TESTS PASSED'

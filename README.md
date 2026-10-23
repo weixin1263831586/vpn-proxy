@@ -1,136 +1,121 @@
 # VPN HTTP 代理
 
-本项目将一台已有 VPN 连接的 Linux 主机作为 HTTP 正向代理出口，让其他机器上的 curl、Git 等应用通过这台主机访问外网。项目负责代理部署、客户端环境配置、VPN 出口限制和健康检查；VPN 连接由主机原有的 VPN 客户端维护。
+让其他电脑的浏览器、curl、Git 等应用，通过一台已连接 VPN 的 Ubuntu 主机访问外网。服务端使用 Squid，按客户端 IP/CIDR 白名单授权，并用 nftables 和策略路由限制代理出口；支持 Linux Bash 和 Windows PowerShell 客户端。
 
-访问权限由服务端配置的来源地址白名单决定，默认只显式授权已知的编译服务器。支持 Linux Bash 和 Windows PowerShell 客户端，每个用户独立安装自己的代理环境。
+项目不负责建立或重连 VPN，只转发使用代理的 HTTP/HTTPS 应用流量。HTTPS 使用 CONNECT 隧道，不解密目标站点的 TLS。
 
-## 架构
+## 当前配置
 
-```mermaid
-flowchart LR
-    subgraph Client[客户端主机]
-        Env[用户代理环境变量]
-        App[curl / Git / 支持代理的应用]
-        Env --> App
-    end
-    subgraph Host[已有 VPN 的代理主机]
-        Download[安装脚本下载服务]
-        Squid[Squid HTTP 正向代理]
-        Guard[nftables + 策略路由双层限制代理 UID 出站]
-        Watch[防火墙守护进程]
-        VPN[已建立的 VPN 接口]
-        Timer[systemd 健康检查定时器]
-        Health[本机回环代理监听]
-        State[状态文件与 journal]
-        Download -. 安装当前用户环境 .-> Env
-        Squid --> Guard --> VPN
-        Watch -. 检查并自愈规则 .-> Guard
-        Watch -. 失败联动停服 .-> Squid
-        Timer --> Health --> Squid
-        Timer --> State
-    end
-    App -->|HTTP 请求 / HTTPS CONNECT| Squid
-    VPN --> Internet[外部 HTTP / HTTPS 服务]
-```
+以下为仓库 [config.json](config.json) 的配置，实际运行状态以已部署服务为准：
 
-当前仓库配置的监听如下，均由 `config.json` 生成或读取：
-
-| 用途 | 当前地址 | 访问方式 |
-| --- | --- | --- |
-| 应用代理 | `172.16.14.233:7897` | 通过来源 CIDR 白名单控制 |
-| 本机健康检查 | `127.0.0.1:17897` | 仅回环监听 |
-| Linux 安装脚本 | `172.16.14.233:8089/install.sh` | 与代理共用来源网段配置 |
-| Windows 安装脚本 | `172.16.14.233:8089/install.ps1` | 与 Linux 下载共用访问策略 |
-| 外网出口 | `ppp0` | 依赖主机已建立的 VPN 和路由 |
-
-这些是当前部署参数，客户端和服务端程序不校验某一台固定的客户端机器。
-
-## 工作原理
-
-### 应用如何使用代理
-
-客户端安装器写入 `http_proxy`、`https_proxy` 及对应的大写变量，并清除 `all_proxy` / `ALL_PROXY`。支持这些变量的应用随后连接 Squid。
-
-HTTP 请求由 Squid 转发。HTTPS 请求先向 Squid 发送 CONNECT，建立到目标 443 端口的 TCP 隧道，再由客户端与目标站点进行 TLS 握手。项目没有配置 TLS 解密或证书替换，因此 `https_proxy` 仍使用 `http://代理地址:端口`。
-
-`no_proxy` 用于让指定地址绕过代理。安装器保留用户已有条目，加入本机回环地址、所选代理主机，以及配置或参数指定的条目。默认条目除回环和 RFC1918 CIDR 外，已包含已知编译服务器和内网服务的具体地址（`10.10.10.4`、`10.10.10.29`、`10.10.10.206`、`172.16.14.233`、`172.16.14.66`），在旧版 curl 上也生效；内网域名仍需按实际 Gerrit/Git/Redmine 地址补充。CIDR 条目依赖 curl 7.86.0 及以上，详见[操作说明](docs/operations.md)。
-
-此方式只影响使用该代理的应用。脚本不修改客户端默认路由，也不部署系统级流量转发或 NAT；已运行的子进程、其他用户及独立 systemd 任务不会自动继承当前用户的新环境。
-
-### 代理访问控制与 DNS
-
-Squid 只允许 `allowed_clients` 中的来源网段，以及本机回环健康检查。目标端口限于 80、443，CONNECT 仅允许 443；访问回环、私网、链路本地等配置列出的目标地址会被拒绝。
-
-Squid 直接向 `dns_nameservers` 指定的 DNS 服务器查询。DNS 请求由代理进程发出，也受 VPN 出口规则约束，不通过主机的本地 DNS stub 转发。
-
-代码关闭磁盘缓存，保留访问和运行日志。
-
-### VPN 断线保护
-
-Squid 以独立系统用户 `rk-vpn-proxy` 运行。[scripts/firewall.sh](scripts/firewall.sh) 创建专用 `inet rk_vpn_proxy` 表，只匹配这个用户的出站流量，依次放行：
-
-1. 从代理监听端口返回客户端的连接回复。
-2. Squid 在回环接口上的本机 UDP 进程通信。
-3. 经 `vpn_interface` 指定接口发出的流量，包括 DNS。
-
-其余出站流量被拒绝。即在专用 nftables 规则保持生效的情况下，阻止代理经非 VPN 接口出站；规则异常由守护进程检测并触发代理停止。普通 VPN 掉线由内核中的规则直接阻断，即使系统改用普通网卡，代理也不能借用该出口；VPN 接口及正确路由恢复后，新请求可恢复，已经断开的下载仍需客户端重试。
-
-在此之上还有第二层独立于 nftables 的出站约束：`ip rule` 将代理 UID 的路由查找指向专用路由表（默认表 240），该表只提供 `VPN 接口默认路由` 和 `unreachable 兜底`；`allowed_clients` 网段例外，继续查 main 表以沿用管理员的回程路由（含动态路由）。因此即使整个 nftables 表被删除，代理也只能经 VPN 出站或直接不可达，不会回退到普通网卡默认路由。策略路由规则的优先级在安装时动态分配：按序跳过系统已有 `ip rule` 占用的优先级，客户端回程规则始终位于兜底规则之前，任意数量的客户端网段都不会互相冲突或反超兜底规则。IPv6 侧同样安装兜底规则与 `unreachable` 路由：除非 VPN 接口本身提供 IPv6 默认路由，代理 UID 没有 IPv6 出口，具备 IPv6 公网的机器也无法绕过 IPv4 约束。守护进程每秒核对 nftables 规则和策略路由的实际状态（规则、优先级顺序、兜底路由），并对缺失部分做幂等自愈。
-
-两层约束各自独立：只删 nftables 表会被策略路由兜底；只删策略路由规则会被约 1 秒内的自愈恢复，同时 nftables 仍在强制 VPN 出口。理论上同时删除两层才可能产生秒级窗口，这需要特权操作且超出单点故障范畴。CI 的零泄漏门禁在隔离网络命名空间内以 IPv4 测试流量验证上述结论，是对指定故障场景的回归验收，不构成对所有网络条件的零泄漏证明。
-
-`rk-vpn-proxy-firewall.service` 原子加载 nftables 规则并安装策略路由，确认两层就绪后才允许代理启动，此后每秒对比专用表的完整规则（忽略计数值）、修复缺失的策略路由并重新验证实际规则、优先级顺序与兜底路由：验证通过才刷新健康标记，策略路由持续修复失败会清除标记（`FIREWALL_ENFORCED=0`）并继续尝试，不会把失效的第二层报告为正常；VPN 正常掉线时仅保留不可达兜底不算失效，守护进程也不会因此退出。nftables 规则缺失或变化时守护进程失败退出，`BindsTo` 联动停止代理；守护进程意外退出也会触发停服。代理每次启动还会复查两层约束（`firewall.sh --check`）。安装与升级前 `firewall.sh --precheck`/`--validate` 只读检查路由表和策略路由规则是否被其他程序占用，发现冲突直接拒绝安装而不是先删后建。停止服务保留现有规则，排查后需手动重启防火墙和代理；`firewall.sh --cleanup` 按所有权签名（代理 UID + 查表动作、镜像默认路由、不可达兜底）移除本项目两层规则并保留无关内容，`--cleanup-routing` 仅移除策略路由部分。
-
-### 配置生成与健康检查
-
-[configuration.py](configuration.py) 校验配置，[build-installer.py](build-installer.py) 生成独立客户端安装脚本、Squid 配置及运行参数文件。生成文件位于 `build/`。部署后的配置位于 `/etc/rk-vpn-proxy/`，下载程序及脚本副本位于 `/usr/local/lib/rk-vpn-proxy/`，下载服务从已部署配置读取访问白名单。
-
-健康检查由 `rk-vpn-health` 用户运行，定时器开机约 45 秒后首次触发，此后约每 60 秒执行一次。它分别记录 `VPN_UP`、`VPN_ROUTE_OK`、`PROXY_REACHABLE`、`FIREWALL_ENFORCED`，检查接口地址、DNS 路由、守护进程最近 3 秒内的规则检查结果及回环代理的 HTTPS 出口。防火墙失效时跳过公网请求。
-
-检查失败返回非零退出码；状态变化和出口 IP 变化写入 journal。状态文件保存在 `/var/lib/rk-vpn-proxy/status` 和 `/var/lib/rk-vpn-proxy/exit-ip`。健康检查负责探测和记录，不控制 VPN 重连。
-
-## 优点与限制
-
-| 优点 | 对应实现 |
+| 用途 | 地址 / 配置 |
 | --- | --- |
-| 适用于多台客户端、多个用户 | 客户端安装按当前 `HOME` 写入，权限按服务端 CIDR 控制 |
-| 应用接入方便 | 使用常见 HTTP 代理环境变量，支持 HTTPS CONNECT |
-| 出口限制范围明确 | nftables 与代理 UID 策略路由双层限制，只作用于 `rk-vpn-proxy` 用户 |
-| VPN 中断时阻止普通网络回退 | 按实际出站接口放行，其他出口拒绝；nftables 表被删除时由策略路由兜底 |
-| 部署参数集中管理 | 配置校验后生成代理、客户端和防火墙运行参数 |
-| 可运维和验证 | systemd 服务、日志轮转、状态探测、配置备份与隔离网络测试 |
+| HTTP 代理 | `http://172.16.14.233:7897` |
+| 本机健康检查代理 | `http://127.0.0.1:17897`，仅回环监听 |
+| Linux 安装器 | `http://172.16.14.233:8089/install.sh` |
+| Windows 安装器 | `http://172.16.14.233:8089/install.ps1` |
+| VPN 接口 | `ppp0` |
+| 客户端白名单 | `10.10.10.206/32`、`172.16.14.66/32` |
 
-实际使用中需要考虑以下限制：
+下载服务与代理共用客户端白名单。`installer_enabled` 缺省为 false，本仓库配置显式设为 true。
 
-- 支持范围是 HTTP/HTTPS 应用代理，不提供全系统隧道、UDP 代理或任意端口的 TCP 转发；部分应用需要另行设置代理。
-- 代理主机和 VPN 是共同依赖。代码不建立 VPN、不实现 VPN 自动重连，也没有多代理节点切换功能。
-- 安装包含公网连通性检查；普通执行失败会尝试恢复部署前的文件、服务、项目 UFW 规则及代理 UID 策略路由（安装前快照包含策略路由状态）。部署验收以代理 HTTPS 就绪检查为准，安装结束时的首次健康探测只记录状态，失败不触发回滚。已安装软件包、新建账户和日志保留，断电或 SIGKILL 不会执行自动恢复（可用事务快照人工恢复）。
-- 访问控制基于来源 IP/CIDR，没有账号密码认证；HTTP 安装脚本下载入口默认关闭（`installer_enabled` 默认 false），本仓库为保留一键安装显式开启。该入口使用 HTTP，没有 HTTPS、签名校验或下载令牌，推荐核对主机密钥后通过 SSH 下载执行；HTTP 一键安装只适用于信任下载链路的环境。
-- 出站约束为双层：nftables 规则 + 代理 UID 策略路由。删除整个 nftables 表由策略路由兜底（隔离测试以零泄漏为验收门禁，覆盖范围限于指定隔离网络的 IPv4 测试流量）；删除策略路由规则由守护进程约 1 秒内自愈，期间 nftables 仍在强制 VPN 出口。理论上同时删除两层才可能出现秒级窗口，属于特权操作场景。代理 UID 的 IPv6 出口由策略路由显式封闭（除非 VPN 接口提供 IPv6 默认路由），nftables 表被删除时该封闭仍然生效。
-- 代理 UID 的路由查找先于 Tailscale 等其他策略路由生效：代理流量不经 Tailscale 出站；`allowed_clients` 网段必须能经 main 表路由（回程路由需已存在），否则客户端无法连通。
-- 服务端监听、DNS 配置和健康路由探测按 IPv4 实现；策略路由第二层同时约束 IPv4 与代理 UID 的 IPv6 出口（默认不可达），但没有完整的 IPv6 客户端部署流程。
-- 健康检查依赖公网探测服务，只记录状态和 IP 变化，不发送外部告警。项目未提供带宽限额、连接配额或性能保证。
+## 部署与重启
 
-## 使用入口
-
-服务端编辑 [config.json](config.json) 后执行 `sudo bash install.sh`。默认白名单只显式授权已知编译服务器（`10.10.10.206/32`、`172.16.14.66/32`），新增客户端时按实际授权范围修改 `allowed_clients`；多办公网段属于部署示例而非默认策略。禁止 `0.0.0.0/0`、`::/0`；公网来源须显式设置 `allow_public_clients: true`。
-
-Linux 推荐通过可信 SSH 安装（替换实际账号并核对主机密钥）：
+代理服务器需要支持 apt、systemd 的 Ubuntu，已连接 VPN，并具备到客户端的回程路由。首次部署前安装基础依赖：
 
 ```bash
-tmp=$(mktemp)
-if ssh proxy_user@172.16.14.233 'cat /usr/local/lib/rk-vpn-proxy/build/client-install.sh' > "$tmp"; then
-    source "$tmp"
-    result=$?
-else
-    echo '下载安装脚本失败' >&2
-    result=1
-fi
-rm -f -- "$tmp"
-test "$result" -eq 0
+sudo apt-get update
+sudo apt-get install -y python3 curl iproute2 util-linux
 ```
 
-信任内网 HTTP 下载链路时，可执行一键安装：
+在项目目录编辑 `config.json`：
+
+| 字段 | 按实际环境设置 |
+| --- | --- |
+| `listen_host` | 服务器本机的 IPv4 监听地址 |
+| `advertise_host` | 客户端能访问的服务器 IP 或域名 |
+| `vpn_interface` | 已建立连接的 VPN 接口 |
+| `allowed_clients` | 获准接入的客户端 IP/CIDR |
+| `no_proxy` | 客户端需要直连的内网地址或域名 |
+
+完整字段见[操作说明](docs/operations.md#部署服务端)。编辑后部署：
+
+```bash
+cd /home/hcq/vpn-proxy  # 按实际源码位置调整
+sudo bash install.sh
+```
+
+安装器按需安装 Squid/nftables，更新系统目录中的运行副本、重启并检查服务；普通失败会尝试恢复部署前状态。已有发行版 `squid.service` 正在运行时，须先处理迁移。
+
+**修改源码或配置后重新运行 `install.sh`；仅重启不会更新运行副本。** 重启已安装版本及查看日志：
+
+```bash
+sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
+systemctl status rk-vpn-proxy-firewall.service rk-vpn-proxy.service --no-pager
+sudo journalctl -u rk-vpn-proxy.service -u rk-vpn-proxy-firewall.service -n 50 --no-pager
+```
+
+启用了下载服务时，可单独执行 `sudo systemctl restart rk-vpn-proxy-installer.service`。
+
+### 在其他主机部署新代理服务器
+
+从当前主机同步工作区（两端需有 rsync），替换实际账号和目标地址：
+
+```bash
+rsync -av \
+  --exclude='.git/' --exclude='build/' --exclude='__pycache__/' \
+  --exclude='validation/' --exclude='vpn.txt' \
+  /home/hcq/vpn-proxy/ proxy_user@NEW_HOST:~/vpn-proxy/
+ssh proxy_user@NEW_HOST
+```
+
+在目标 Ubuntu 主机连接好 VPN，安装上述基础依赖后执行：
+
+```bash
+cd ~/vpn-proxy
+nano config.json
+sudo bash install.sh
+```
+
+将监听地址、发布地址、VPN 接口、白名单和内网绕过条目改为新环境的实际值。
+
+## 其他电脑使用本机代理
+
+客户端无需安装 VPN 客户端，但必须能访问代理主机的 `7897` 端口。先在服务器的 `config.json` 中添加客户端 IP，保留已有条目；例如新增 `192.168.1.100`（以下为字段片段）：
+
+```json
+"allowed_clients": ["10.10.10.206/32", "172.16.14.66/32", "192.168.1.100/32"]
+```
+
+替换为实际客户端 IP，然后在服务器项目目录运行 `sudo bash install.sh`。公网客户端需显式设置 `allow_public_clients: true`；始终禁止 `0.0.0.0/0` 和 `::/0`。
+
+### 临时使用
+
+Linux / Bash 在客户端终端执行：
+
+```bash
+export http_proxy=http://172.16.14.233:7897
+export https_proxy="$http_proxy"
+unset all_proxy ALL_PROXY
+curl --noproxy '' --proxy "$http_proxy" --connect-timeout 10 --max-time 30 -I https://www.google.com
+```
+
+Windows 浏览器可在“设置 → 网络和 Internet → 代理 → 手动设置代理”中填写地址 `172.16.14.233`、端口 `7897`。PowerShell 终端可另行配置：
+
+```powershell
+$env:http_proxy = 'http://172.16.14.233:7897'
+$env:https_proxy = $env:http_proxy
+Remove-Item Env:all_proxy -ErrorAction SilentlyContinue
+curl.exe --noproxy "localhost,127.0.0.1" --proxy $env:http_proxy --connect-timeout 10 --max-time 30 -I https://www.google.com
+```
+
+终端变量只影响当前终端及其启动的程序。测试代理时不要用 `--noproxy "*"`，它会绕过代理。
+
+### 持久安装
+
+推荐通过核对主机密钥后的 SSH 获取安装器，步骤见[客户端配置](docs/operations.md#配置客户端)。信任内网 HTTP 下载链路时，也可使用以下方式（需开放并能访问 `8089` 端口）。
+
+Linux：在客户端 Bash 中以实际使用代理的用户执行，下载成功后加载安装器：
 
 ```bash
 tmp=$(mktemp)
@@ -145,52 +130,37 @@ rm -f -- "$tmp"
 test "$result" -eq 0
 ```
 
-两种方式都先下载到临时文件、确认成功后再执行，下载失败时返回非零，不会误判为安装成功。
-
-Windows 使用 PowerShell；CMD 中先输入 `powershell -NoProfile`：
+Windows：在 PowerShell 中执行（CMD 用户先输入 `powershell -NoProfile`）：
 
 ```powershell
 $proxyScript = curl.exe --noproxy "*" -fsSL http://172.16.14.233:8089/install.ps1
 if ($LASTEXITCODE -ne 0) { throw "Installer download failed" }; & ([scriptblock]::Create(($proxyScript -join "`n"))) -SystemProxy
 ```
 
-安装完成自动测试 Google。Windows PowerShell 中手动测试使用 `curl.exe -I https://www.google.com`。
+Bash 安装器配置当前终端和后续 Bash；Windows 安装器配置当前进程和用户环境，`-SystemProxy` 额外设置 Windows 用户代理。两者先验证代理连通性再写入配置，并保留恢复备份；安装后自动测试。已运行的其他终端或应用可能需要重开。
 
-配置字段、SSH 安装方式、客户端参数、维护及恢复步骤见 [操作说明](docs/operations.md)。
+`no_proxy` 保留已有条目并合并配置中的内网地址。旧版 curl 可能不支持 CIDR 绕过，应显式添加实际内网 IP/域名；备份恢复、SSH 安装和参数覆盖见[操作说明](docs/operations.md)。
 
-## 验证
+## 出口保护与限制
+
+- Squid 以独立用户运行；nftables 允许客户端连接回复、本机 helper 通信及 VPN 接口出站，拒绝其他出口。DNS 查询也由该用户发出。
+- 策略路由为代理 UID 设置 VPN 默认路由和不可达兜底；客户端白名单网段例外，沿用 main 表回程路由。守护进程持续核对规则、修复路由；nftables 规则异常或守护进程退出时，systemd 联动停止代理。
+- VPN 掉线时阻断代理流量；接口和路由恢复后新请求可恢复，已断开的下载需重试。保护依赖实际路由和规则状态，隔离测试的零泄漏结果仅覆盖指定故障与测试流量。
+- 访问控制基于来源 IP，没有账号密码认证。目标仅允许 80/443，CONNECT 仅允许 443，并拒绝配置列出的私网、回环和链路本地等地址。
+- 当前服务端按 IPv4 监听和部署；IPv6 策略路由用于出站保护，不代表提供完整 IPv6 客户端支持。
+- 项目不提供全系统隧道、UDP 转发、VPN 自动重连或多节点切换。HTTP 安装下载无传输完整性保护，应仅在可信链路使用。
+
+路由表、规则优先级、健康状态及故障边界见[架构说明](docs/architecture.md)；部署恢复和日常维护见[操作说明](docs/operations.md#运行维护)。
+
+## 验证与源码
 
 ```bash
 python3 -B -m unittest discover -s tests -v
+bash tests/test_policy_routing.sh
+bash tests/test_policy_routing_kernel.sh
 sudo bash tests/test-killswitch.sh --systemd
 ```
 
-回归测试覆盖配置、客户端、HTTP 下载异常、部署快照恢复（含策略路由状态）及 UFW 规则归属；`tests/test_policy_routing.sh` 以桩 `ip`/`nft` 回归策略路由的优先级分配、资源独占预检、所有权清理与守护进程标记门控。隔离网络测试实际启动 Squid、加载 nftables 与策略路由，验证 VPN 掉线和恢复、规则修改和删除、多客户端优先级顺序、IPv6 出口封闭、VPN 接口重建自愈，以及 systemd 联动停服，并以两道零泄漏门禁验收：VPN 掉线期间、以及删除整个 nftables 表到代理停止期间，经备用网卡转发的请求数都必须为零，否则 CI 失败（门禁结论限于隔离网络内的 IPv4 测试流量）。CI 在一次性 Ubuntu 运行器上额外执行真实部署故障注入演练（配置错误升级、apt 下载失败、SIGTERM/SIGKILL 中断恢复、首次安装中断残留清理、旧版代理运行中回滚、禁用安装入口与完整回滚），见 [tests/test-deployment-drill.sh](tests/test-deployment-drill.sh)。
+内核路由测试需要用户命名空间权限，也可加 sudo 执行；systemd 集成测试在隔离网络中验证真实 Squid 转发、VPN 掉线/恢复及保护规则故障。CI 另有 Windows PowerShell 5.1/7 测试和一次性环境部署演练，详见[验证说明](docs/operations.md#验证)。
 
-## 目录与维护职责
-
-```text
-vpn-proxy/
-├── README.md
-├── config.json                  # 部署参数
-├── install.sh / rollback.sh     # 服务端部署与停用
-├── check-client.sh              # 连通性诊断入口
-├── configuration.py             # 共享配置校验
-├── build-installer.py           # 生成部署文件
-├── serve-installer.py           # 安装脚本下载服务
-├── templates/                   # Bash / PowerShell 安装器、Squid 配置模板
-├── scripts/                     # 防火墙、健康检查及部署状态管理
-├── systemd/                     # 代理、防火墙守护、健康检查及下载服务
-├── tests/                       # 回归测试及隔离网络测试
-├── docs/                        # 操作说明
-├── .github/workflows/           # CI
-└── build/                       # 自动生成，不纳入版本控制
-```
-
-拆分按职责和运行边界进行：
-
-- `configuration.py` 同时被生成器、下载服务及诊断工具使用，保留为共享模块。
-- 客户端安装流程与环境配置放在一个模板中，便于维护完整的安装行为。
-- 防火墙、代理、健康检查和下载服务有独立的账户、依赖和启停方式，systemd 单元分别维护；定时器只负责调度。
-- `build/` 中的 `client-install.sh`、`client-install.ps1`、`squid.conf` 和 `runtime.env` 都是生成物，可以删除后重新运行 `python3 build-installer.py` 生成。已部署服务使用系统目录中的副本，不依赖源码下的生成目录。
-- 运行日志、安装包、Python 缓存和人工验证记录不属于源码；运行日志由系统日志目录管理，历史审核材料可在项目外归档。
+核心源码：配置校验 [configuration.py](configuration.py)、生成器 [build-installer.py](build-installer.py)、客户端与 Squid 模板 [templates/](templates/)、防火墙与部署恢复 [scripts/](scripts/)、服务单元 [systemd/](systemd/)。`build/` 是生成目录；运行 `python3 build-installer.py` 可重建，正式服务使用系统目录中的副本。
