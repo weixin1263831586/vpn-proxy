@@ -54,6 +54,22 @@ ip route get 8.8.8.8 uid 0 | grep -F 'dev vpn0 table 240'
 ip link delete vpn0
 fw --check
 if ip route get 8.8.8.8 uid 0; then echo 'FAIL: missing VPN allowed routing' >&2; exit 1; fi
+# A foreign rule with a lower preference can answer before the egress rule
+# is ever consulted; the effective-route check must catch it in the kernel's
+# own answer, not in rule listings.
+ip link add wan0 type dummy
+ip address add 198.51.100.2/24 dev wan0
+ip link set wan0 up
+ip route add default via 198.51.100.1 dev wan0 metric 10
+ip rule add pref 50 lookup main
+if ip route get 8.8.8.8 uid 0 | grep -qF 'dev wan0'; then :; else
+    echo 'FAIL: fixture does not reproduce the preemption.' >&2; exit 1
+fi
+if fw --check; then echo 'FAIL: foreign preemption accepted' >&2; exit 1; fi
+ip rule del pref 50 lookup main
+ip route del default via 198.51.100.1 dev wan0 metric 10
+ip link delete wan0
+fw --check
 fw --cleanup
 if ip -4 rule show | grep -qF 'uidrange 0-0'; then exit 1; fi
 if ip -6 rule show | grep -qF 'uidrange 0-0'; then exit 1; fi

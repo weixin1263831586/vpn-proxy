@@ -5,12 +5,22 @@ mode=${1:---apply}
 # --cleanup/--cleanup-routing must work during rollback, after restore already
 # removed the deployed runtime.env; every other mode requires it. --precheck
 # also runs before the proxy system user exists.
-if [[ "$mode" != --cleanup && "$mode" != --cleanup-routing && "$mode" != --precheck ]]; then
-    [[ -f "$runtime" ]] || { echo "Missing runtime environment: $runtime" >&2; exit 1; }
+if [[ -f "$runtime" ]]; then
     source "$runtime"
+elif [[ "$mode" != --cleanup && "$mode" != --cleanup-routing && "$mode" != --precheck ]]; then
+    echo "Missing runtime environment: $runtime" >&2; exit 1;
 fi
 state_dir=${RK_VPN_FIREWALL_STATE:-/run/rk-vpn-proxy-firewall}
 routing_table=${RK_VPN_ROUTING_TABLE:-240}
+# Proof that a managed deployment owns the routing resources: install.sh
+# creates the deployed marker once the deployment passed its readiness
+# checks; an existing /etc/rk-vpn-proxy/runtime.env proves an earlier
+# managed install (upgrades). --precheck needs this to distinguish this
+# project's own leftover routes from a foreign service that happens to
+# use the same table and route signatures.
+deploy_state=${RK_VPN_DEPLOY_STATE:-/var/lib/rk-vpn-proxy-deploy}
+deployment_recorded() { [[ -f "$deploy_state/deployed" || -f "$runtime" ]]; }
+VPN_INTERFACE=${VPN_INTERFACE:-}
 # Lowest candidate preference for the per-client return rules. Preferences are
 # allocated dynamically, skipping every preference already in use, so a large
 # allowed_clients list can never collide with the catch-all egress rule below
@@ -18,6 +28,19 @@ routing_table=${RK_VPN_ROUTING_TABLE:-240}
 rule_pref_start=90
 proxy_uid=$(id -u rk-vpn-proxy 2>/dev/null || true)
 uid_selector=${proxy_uid:+"uidrange $proxy_uid-$proxy_uid"}
+# Addresses used to verify the effective route of the proxy UID. They must
+# never be listed in ALLOWED_CLIENTS, so only the catch-all egress rule can
+# answer the probe. Override per environment for tests and air-gapped hosts.
+route_probe_v4=${RK_VPN_ROUTE_PROBE_V4:-8.8.8.8}
+route_probe_v6=${RK_VPN_ROUTE_PROBE_V6:-2606:4700:4700::1111}
+# Fail-closed proxy supervision: the deployed --watch unit sets
+# RK_VPN_MANAGE_PROXY=1 so a broken protection stops the proxy until both
+# layers verify clean again. Ad-hoc interactive runs stay read-only.
+manage_proxy=0
+if [[ ${RK_VPN_MANAGE_PROXY:-0} == 1 ]] && command -v systemctl >/dev/null 2>&1; then
+    manage_proxy=1
+fi
+proxy_unit=${RK_VPN_PROXY_UNIT:-rk-vpn-proxy.service}
 if [[ -z "$proxy_uid" && "$mode" != --cleanup && "$mode" != --cleanup-routing && "$mode" != --precheck ]]; then
     echo 'Missing rk-vpn-proxy system user.' >&2
     exit 1
@@ -67,12 +90,18 @@ client_networks_for_family() {
 owned_route() {
     # Routes this project writes: the mirrored metric-100 VPN default and the
     # metric-200 unreachable fallback. IPv6 listings render the fallback as
-    # "unreachable default dev lo metric 200 pref medium".
+    # "unreachable default dev lo metric 200 pref medium". The VPN default
+    # must additionally reference the configured VPN interface: an unrelated
+    # service that mirrors the metric-100 signature through its own device is
+    # foreign and must never be deleted or claimed (the precheck refuses it).
+    # Without a runtime environment (late rollback after /etc was removed)
+    # the interface is unknown, so the legacy signature alone is used.
     local line=$1
     if [[ "$line" == "unreachable default"* && " $line " == *" metric 200 "* ]]; then
         return 0
     fi
-    if [[ "$line" == "default "* && " $line " == *" metric 100 "* ]]; then
+    if [[ -z "$VPN_INTERFACE" || " $line " == *" dev $VPN_INTERFACE "* ]] &&
+        [[ "$line" == "default "* && " $line " == *" metric 100 "* ]]; then
         return 0
     fi
     return 1
@@ -262,13 +291,46 @@ check_policy_routing() {
     done
 }
 
+route_get_uid() {
+    # The kernel's answer for the proxy UID: every rule with a lower
+    # preference is consulted first, so this reflects what Squid's traffic
+    # would actually do regardless of which service owns which rule.
+    ip "-$1" route get "$2" uid "$proxy_uid" 2>/dev/null
+}
+
+check_effective_route() {
+    # Final truth for the second layer: resolve the effective route for the
+    # proxy UID exactly as its packets would be routed. A foreign rule at a
+    # lower preference that reaches the main table wins before our egress
+    # rule is ever consulted; existence and ordering checks cannot see that,
+    # but the route lookup exposes it. The probe addresses are not allowed
+    # client networks, so only the catch-all egress rule may answer: through
+    # the VPN device while it is up, or not at all (unreachable fallback)
+    # while it is down. Failure is fail-closed.
+    local family probe route
+    for family in 4 6; do
+        family_available "$family" || continue
+        probe=$route_probe_v4
+        [[ "$family" == 6 ]] && probe=$route_probe_v6
+        route=$(route_get_uid "$family" "$probe") || continue
+        if [[ "$route" != *" dev $VPN_INTERFACE"* ]]; then
+            echo "firewall.sh: proxy UID route to $probe bypasses $VPN_INTERFACE: $route" >&2
+            return 1
+        fi
+    done
+}
+
 precheck_policy_routing() {
     # Read-only deployment gate: refuse when the routing table or its lookup
     # rules are already used by anything this project does not own, instead
-    # of deleting foreign state and re-creating it.
-    local family line rest problems=0
+    # of deleting foreign state and re-creating it. Routes matching this
+    # project's signature are only accepted with a deployment record: on a
+    # first install they would equally belong to another service that copies
+    # the signature, so without proof of ownership the install is refused.
+    local family line rest problems=0 owned_seen=0
     for family in 4 6; do
         family_available "$family" || continue
+        owned_seen=0
         while read -r line; do
             [[ -z "$line" ]] && continue
             rest=${line#*:}
@@ -288,19 +350,28 @@ precheck_policy_routing() {
         done < <(family_rules "$family")
         while read -r line; do
             [[ -z "$line" ]] && continue
-            if ! owned_route "$line"; then
+            if owned_route "$line"; then
+                owned_seen=1
+            else
                 echo "firewall.sh: routing table $routing_table contains a foreign route: $line" >&2
                 problems=1
             fi
         done < <(ip -"$family" route show table "$routing_table" 2>/dev/null || true)
+        if (( owned_seen )) && ! deployment_recorded; then
+            echo "firewall.sh: routing table $routing_table contains routes with this project's signature but no managed deployment is recorded; refusing to claim them." >&2
+            problems=1
+        fi
     done
     (( ! problems ))
 }
 
 if [[ "$mode" == --check ]]; then
     # Read-only verification of both layers; used before the proxy starts.
+    # The effective-route check must also pass: a foreign rule that routes
+    # the proxy UID before our egress rule is exactly what this catches.
     check_rules
     check_policy_routing
+    check_effective_route
     exit
 fi
 [[ "$mode" == --apply || "$mode" == --watch || "$mode" == --validate || "$mode" == --cleanup || "$mode" == --cleanup-routing || "$mode" == --precheck ]] || {
@@ -368,23 +439,39 @@ if [[ "$mode" == --watch ]]; then
     trap 'exit 0' TERM INT
     mark_enforced
     [[ -z ${NOTIFY_SOCKET:-} ]] || systemd-notify --ready
+    proxy_paused=0
     iterations=${RK_VPN_WATCH_ITERATIONS:-0}
     while sleep 1; do
         if ! check_rules; then
             echo 'FIREWALL_ENFORCED=0: proxy firewall missing or changed; stopping protected proxy.' >&2
+            if (( manage_proxy )); then
+                systemctl stop "$proxy_unit" >/dev/null 2>&1 || true
+            fi
             exit 1
         fi
         # Route repair commands tolerate transient failure, so the health
         # marker is refreshed only after re-verifying the actual rules,
-        # preference order and fallback routes. A persistently broken second
-        # layer clears the marker while the daemon keeps repairing; a VPN
-        # outage alone stays healthy with just the unreachable fallback.
+        # preference order, fallback routes and the kernel-resolved effective
+        # route. A VPN outage alone stays healthy with just the unreachable
+        # fallback, but a missing protection layer is fail-closed: the proxy
+        # is stopped until the layer verifies clean again.
         ensure_policy_routing
-        if check_policy_routing; then
+        if check_policy_routing && check_effective_route; then
             mark_enforced
+            if (( manage_proxy && proxy_paused )); then
+                proxy_paused=0
+                if ! systemctl start "$proxy_unit" >/dev/null 2>&1; then
+                    echo 'failed to restart the protected proxy after recovery.' >&2
+                fi
+            fi
         else
             clear_enforced
             echo 'FIREWALL_ENFORCED=0: policy routing incomplete after repair attempt.' >&2
+            if (( manage_proxy )); then
+                proxy_paused=1
+                echo 'fail-closed: protection layer is incomplete; stopping the proxy until routing verifies again.' >&2
+                systemctl stop "$proxy_unit" >/dev/null 2>&1 || true
+            fi
         fi
         if (( iterations > 0 )); then
             iterations=$(( iterations - 1 ))

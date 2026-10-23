@@ -121,6 +121,26 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y squid nftables
 systemctl stop squid.service 2>/dev/null || true
 
+echo "== Scenario C2: a foreign default route in table 240 blocks the first install =="
+# Another service already mirrors this project's signature inside the table.
+# Without a deployment record the precheck must refuse to claim it, and the
+# route must survive the failed install untouched.
+ip route add default dev "$default_iface" metric 100 table 240
+if run_install "$drill_dir/config1.json" "$drill_dir/install-c2.log"; then
+    echo 'FAIL: install claimed foreign routing resources.' >&2; exit 1
+fi
+grep -F 'no managed deployment is recorded' "$drill_dir/install-c2.log" >/dev/null || {
+    echo 'FAIL: refusal reason missing from the install log.' >&2; exit 1;
+}
+ip route show table 240 | grep -F 'metric 100' >/dev/null || {
+    echo 'FAIL: the foreign route was removed by the refused install.' >&2; exit 1;
+}
+ip route del default dev "$default_iface" metric 100 table 240
+if ip route show table 240 | grep -qF 'metric 100'; then
+    echo 'FAIL: fixture cleanup left a table 240 route.' >&2; exit 1
+fi
+echo 'PASS: first install refuses a copied metric-100 default and keeps it intact.'
+
 echo "== Scenario A: real baseline deployment =="
 if [[ ${DRILL_UFW:-0} == 1 ]] && command -v ufw >/dev/null; then
     ufw --force enable >/dev/null

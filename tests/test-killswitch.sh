@@ -92,9 +92,12 @@ nsenter -t "$server_pid" -n python3 -m http.server 80 --bind 0.0.0.0 --directory
 http_pid=$!
 start_guard() {
     if [[ "$systemd_test" == --systemd ]]; then
+        # RK_VPN_MANAGE_PROXY mirrors the deployed guard unit: the fail-closed
+        # supervisor stops the proxy itself when protection breaks.
         systemd-run --quiet --unit="$guard_unit" --property=Type=notify --property=NotifyAccess=all \
             --property="NetworkNamespacePath=/proc/$$/ns/net" --property=TimeoutStartSec=15s \
             /usr/bin/env "RK_VPN_RUNTIME=$RK_VPN_RUNTIME" "RK_VPN_FIREWALL_STATE=$RK_VPN_FIREWALL_STATE" \
+            "RK_VPN_MANAGE_PROXY=1" "RK_VPN_PROXY_UNIT=$proxy_unit" \
             /bin/bash "$source_dir/scripts/firewall.sh" --watch
     else
         bash "$source_dir/scripts/firewall.sh" --watch > "$test_dir/guard.log" 2>&1 &

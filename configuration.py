@@ -45,6 +45,15 @@ def load_config(path=None):
                 network.version == private.version and network.subnet_of(private)
                 for private in private_ranges):
             raise ValueError("Public client networks require allow_public_clients=true")
+        # firewall.sh resolves these addresses under the proxy UID to verify
+        # the effective route (must answer via the VPN table). A client
+        # network covering a probe address would return the traffic via the
+        # main table and permanently fail that check, so reject it here.
+        for probe in (ipaddress.ip_address("8.8.8.8"),
+                      ipaddress.ip_address("2606:4700:4700::1111")):
+            if probe.version == network.version and probe in network:
+                raise ValueError(f"allowed_clients must not contain {probe}: "
+                                 "it is the effective-route probe address")
     config["allowed_clients"] = list(dict.fromkeys(str(network) for network in networks))
     config["installer_enabled"] = config.get("installer_enabled", False)
     for address in config["dns_nameservers"]:

@@ -8,7 +8,7 @@ Type=notify
 NotifyAccess=all
 RuntimeDirectory=rk-vpn-proxy-firewall
 RuntimeDirectoryMode=0755
-ExecStart=/usr/local/libexec/rk-vpn-proxy-firewall --watch
+ExecStart=/usr/bin/env RK_VPN_MANAGE_PROXY=1 /usr/local/libexec/rk-vpn-proxy-firewall --watch
 ExecStopPost=/usr/bin/rm -f /run/rk-vpn-proxy-firewall/enforced
 TimeoutStartSec=15s
 TimeoutStopSec=5s

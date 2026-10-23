@@ -127,6 +127,9 @@ for attempt in {1..10}; do
     sleep 1
 done
 [[ $ready == 1 ]] || { echo 'Proxy failed the HTTPS readiness check.' >&2; false; }
+# The deployment record proves this project owns its routing resources: the
+# precheck accepts signature-matching routes only while this marker exists.
+touch /var/lib/rk-vpn-proxy-deploy/deployed
 LC_ALL=C python3 -B "$source_dir/scripts/deployment.py" ufw-sync "$config_path"
 if [[ "$INSTALLER_ENABLED" == 1 ]]; then
     systemctl restart rk-vpn-proxy-installer.service

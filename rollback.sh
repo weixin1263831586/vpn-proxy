@@ -22,6 +22,7 @@ if [[ -f "$original/state.json" ]]; then
     # legacy proxy of its firewall protection, so nothing runs after it.
     LC_ALL=C python3 -B "$source_dir/scripts/deployment.py" restore "$original"
     mv -- "$original" "${original%/*}/restored-$(date +%Y%m%d-%H%M%S)-$$"
+    rm -f /var/lib/rk-vpn-proxy-deploy/deployed
     echo 'Restored files, services, proxy firewall, policy routing and owned UFW rules from before the first managed deployment.'
     echo 'Packages, system users, logs and client settings retained.'
     exit 0
@@ -30,6 +31,7 @@ fi
 python3 -B "$source_dir/scripts/deployment.py" stop
 systemctl disable rk-vpn-proxy-installer.service rk-vpn-proxy-health.timer rk-vpn-proxy.service rk-vpn-proxy-firewall.service
 LC_ALL=C python3 -B "$source_dir/scripts/deployment.py" ufw-clear
+rm -f /var/lib/rk-vpn-proxy-deploy/deployed
 cleanup_firewall
 echo 'Proxy and monitoring disabled. Configurations and logs retained for review.'
 echo 'No deployment baseline exists; the original distribution Squid state is unknown and was not changed.'

@@ -18,6 +18,7 @@ mkdir -p "$S" "$bin" "$test_dir/firewall"
 cat > "$bin/ip" <<'STUB'
 #!/bin/bash
 S=$FAKE_IP_STATE
+routing_table_number=240
 family=4
 if [[ ${1:-} == -4 || ${1:-} == -6 ]]; then family=${1#-}; shift; fi
 cmd=${1:-}
@@ -76,6 +77,44 @@ case "$cmd" in
             cat "$S/main$family" 2>/dev/null
             exit 0
         fi
+        if [[ "$sub" == get ]]; then
+            # Minimal policy-routing engine: walk the rules in preference
+            # order and answer with the first default route of the looked-up
+            # table, exactly what check_effective_route depends on. Rules
+            # with a destination selector never match the probe address, and
+            # an unreachable default terminates the lookup the way the kernel
+            # does. The first default line of a table wins (tests seed the
+            # intended winner first).
+            addr=${1:-}
+            shift
+            [[ ${1:-} == uid ]] || exit 2
+            uid=$2
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                rest=${line#*: }
+                [[ "$rest" == *" to "* ]] && continue
+                if [[ "$rest" =~ uidrange\ ([0-9]+)-([0-9]+) ]]; then
+                    (( uid >= BASH_REMATCH[1] && uid <= BASH_REMATCH[2] )) || continue
+                fi
+                [[ "$rest" == *" lookup "* ]] || continue
+                table=${rest##* lookup }
+                table=${table%% *}
+                case "$table" in
+                    main) content=$S/main$family ;;
+                    "$routing_table_number"|0) content=$S/table$family ;;
+                    *) content=$S/table$table ;;
+                esac
+                default=$(grep '^default ' "$content" 2>/dev/null |
+                    awk '{m=0; for (i = 1; i <= NF; i++) if ($i == "metric") m = $(i + 1); print m, $0}' |
+                    sort -n | head -1 | cut -d' ' -f2-)
+                if [[ -n "$default" ]]; then
+                    [[ "$default" == 'unreachable default'* ]] && exit 2
+                    echo "$addr ${default#default }"
+                    exit 0
+                fi
+            done < <(sort -t: -k1,1n "$S/rules$family" 2>/dev/null)
+            exit 2
+        fi
         words=("$@")
         table=$S/table$family
         if [[ ${#words[@]} -ge 2 && ${words[-1]} =~ ^[0-9]+$ && ${words[-2]} == table ]]; then
@@ -133,6 +172,9 @@ if [[ -f "$FAKE_IP_STATE/mutate_once" && ! -f "$FAKE_IP_STATE/mutated" ]]; then
     touch "$FAKE_IP_STATE/mutated"
     bash "$FAKE_IP_STATE/mutate_once"
 fi
+if [[ -f "$FAKE_IP_STATE/mutate_each" ]]; then
+    bash "$FAKE_IP_STATE/mutate_each"
+fi
 exit 0
 STUB
 chmod +x "$bin/ip" "$bin/nft" "$bin/id" "$bin/sleep"
@@ -141,11 +183,13 @@ export FAKE_NFT_STATE=$S
 export FAKE_FW_STATE=$test_dir/firewall
 
 runtime=$test_dir/runtime.env
+deployed_flag=$test_dir/deployed
 write_runtime() {
     printf 'VPN_INTERFACE=vpn0\nPROXY_PORT=17890\nHEALTH_PORT=17891\nALLOWED_CLIENTS="%s"\n' "$1" > "$runtime"
 }
 fw() {
     env PATH="$bin:$PATH" RK_VPN_RUNTIME="$runtime" RK_VPN_FIREWALL_STATE="$test_dir/firewall" \
+        RK_VPN_DEPLOY_STATE="$deployed_flag" \
         bash "$source_dir/scripts/firewall.sh" "$@"
 }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -322,5 +366,93 @@ fw --cleanup-routing
 grep -qxF '81: from all uidrange 149-1490 lookup main' "$S/rules4" || fail 'deleted another UID range'
 grep -qxF '82: from all lookup 2400' "$S/rules4" || fail 'deleted another table lookup'
 echo 'PASS: similarly prefixed UID ranges and table numbers are preserved.'
+
+echo '== gate 1: a copied metric-100 default through a foreign device is not owned =='
+: > "$S/rules4"; : > "$S/rules6"; : > "$S/table4"; : > "$S/table6"
+rm -f "$FAKE_NFT_STATE/table" "$deployed_flag"
+seed_vpn
+write_runtime '10.1.0.0/24'
+# A foreign service mirrors this project's signature but uses its own device:
+# neither precheck nor cleanup may claim or delete it, and without proof of a
+# managed deployment even a dev-matching copy must be refused on first install.
+printf 'default via 192.0.2.1 dev eth1 metric 100\n' >> "$S/table4"
+if fw --precheck; then fail 'precheck accepted a copied foreign default route'; fi
+printf 'default via 203.0.113.1 dev vpn0 metric 100\n' >> "$S/table4"
+if fw --precheck; then fail 'precheck claimed signature routes without a deployment record'; fi
+fw --cleanup-routing
+grep -qxF 'default via 192.0.2.1 dev eth1 metric 100' "$S/table4" || fail 'cleanup deleted the foreign default route'
+if grep -q 'dev vpn0 metric 100' "$S/table4"; then fail 'cleanup kept an owned-signature VPN route'; fi
+# With the deployment record the dev-matching copy is accepted again.
+sed -i '\|default via 192.0.2.1 dev eth1 metric 100|d' "$S/table4"
+touch "$deployed_flag"
+fw --precheck
+echo 'PASS: foreign metric-100 defaults are refused and preserved; deployment record restores ownership.'
+
+echo '== gate 2: effective-route check exposes a preempting foreign main-table rule =='
+: > "$S/rules4"; : > "$S/rules6"; : > "$S/table4"; : > "$S/table6"
+rm -f "$FAKE_NFT_STATE/table" "$S/mutated" "$S/mutate_once" "$S/mutate_each" "$S/marker_log" "$S/fail_rule_add"
+seed_vpn
+# The main table offers a better non-VPN default, like a LAN uplink would.
+printf 'default via 198.51.100.1 dev wan0 metric 10\n' >> "$S/main4"
+write_runtime '10.1.0.0/24'
+RK_VPN_WATCH_ITERATIONS=1 fw --watch
+fw --check
+# A rule with a lower preference that reaches the main table answers before
+# the egress rule is ever consulted; plain rule checks cannot see it.
+echo '50: from all lookup main' >> "$S/rules4"
+if fw --check; then fail 'check accepted a foreign main-table rule above the egress rule'; fi
+rm -f "$S/marker_log"
+watch_output=$(RK_VPN_WATCH_ITERATIONS=2 fw --watch 2>&1 || true)
+grep -qF 'bypasses vpn0' <<<"$watch_output" || fail 'no bypass diagnostic logged'
+grep -qF 'policy routing incomplete' <<<"$watch_output" || fail 'effective-route failure not treated as protection loss'
+[[ "$(cat "$S/marker_log" | tr -d '\n')" == 10 ]] || fail "marker not cleared while routing is preempted: $(cat "$S/marker_log" 2>/dev/null)"
+sed -i '/^50: from all lookup main$/d' "$S/rules4"
+rm -f "$S/marker_log"
+RK_VPN_WATCH_ITERATIONS=1 fw --watch
+fw --check
+assert_invariants 1
+echo 'PASS: foreign preemption is detected through the kernel answer and recovers when removed.'
+
+echo '== gate 3: persistent repair failure fail-closes the proxy until routing recovers =='
+systemctl_log=$S/systemctl.log
+cat > "$bin/systemctl" <<STUB
+#!/bin/bash
+echo "\$*" >> "$systemctl_log"
+exit 0
+STUB
+chmod +x "$bin/systemctl"
+: > "$S/rules4"; : > "$S/rules6"; : > "$S/table4"; : > "$S/table6"
+rm -f "$FAKE_NFT_STATE/table" "$S/mutated" "$S/mutate_once" "$S/mutate_each" \
+    "$S/marker_log" "$S/fail_rule_add" "$systemctl_log"
+seed_vpn
+write_runtime '10.1.0.0/24 10.2.0.0/24'
+# Iteration 1 breaks the second layer and makes repairs fail; iteration 3
+# removes the fault so the daemon can heal again.
+cat > "$S/mutate_each" <<'MUTATE'
+set -e
+count=$(( $(cat "${FAKE_IP_STATE}/mutate-count" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$count" > "${FAKE_IP_STATE}/mutate-count"
+case "$count" in
+    1) sed -i '/to 10.2.0.0\/24 uidrange 149-149 lookup main/d' "${FAKE_IP_STATE}/rules4"
+       touch "${FAKE_IP_STATE}/fail_rule_add" ;;
+    3) rm -f "${FAKE_IP_STATE}/fail_rule_add" ;;
+esac
+MUTATE
+watch_output=$(RK_VPN_WATCH_ITERATIONS=4 RK_VPN_MANAGE_PROXY=1 fw --watch 2>&1 || true)
+grep -qF 'fail-closed' <<<"$watch_output" || fail 'watch did not announce the fail-closed stop'
+stops=$(grep -c '^stop rk-vpn-proxy.service$' "$systemctl_log" || true)
+starts=$(grep -c '^start rk-vpn-proxy.service$' "$systemctl_log" || true)
+(( stops >= 2 )) || fail "expected at least 2 proxy stops during persistent failure, got $stops"
+(( starts == 1 )) || fail "expected exactly 1 proxy start after recovery, got $starts"
+[[ "$(cat "$S/marker_log" | tr -d '\n')" == 1001 ]] || fail "marker did not track breakage and recovery: $(cat "$S/marker_log" 2>/dev/null)"
+assert_invariants 2
+# A missing nftables table must stop the proxy too, not just clear the marker:
+# the table is deleted during the first sleep, inside the running watch loop.
+: > "$systemctl_log"
+rm -f "$FAKE_NFT_STATE/table" "$S/marker_log" "$S/mutate_once" "$S/mutated" "$S/mutate_each"
+printf 'rm -f "${FAKE_NFT_STATE}/table"\n' > "$S/mutate_once"
+RK_VPN_WATCH_ITERATIONS=1 RK_VPN_MANAGE_PROXY=1 fw --watch >/dev/null 2>&1 || true
+grep -q '^stop rk-vpn-proxy.service$' "$systemctl_log" || fail 'proxy was not stopped when the nftables table vanished'
+echo 'PASS: fail-closed supervision stops the proxy on broken protection and restarts it after verified recovery.'
 
 echo 'ALL POLICY-ROUTING STUB TESTS PASSED'

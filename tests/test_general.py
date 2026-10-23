@@ -62,7 +62,9 @@ class GeneralDeploymentTests(unittest.TestCase):
                         {"vpn_interface": 'tun0"; reject'}, {"proxy_port": 8089},
                         {"allowed_clients": ["0.0.0.0/0"], "allow_public_clients": True},
                         {"allowed_clients": ["::/0"]}, {"allowed_clients": ["8.8.8.8/32"]},
-                        {"allow_public_clients": "true"}, {"installer_enabled": "true"}):
+                        {"allow_public_clients": "true"}, {"installer_enabled": "true"},
+                        {"allowed_clients": ["8.8.8.8/32"], "allow_public_clients": True},
+                        {"allowed_clients": ["2606:4700:4700::1111/128"], "allow_public_clients": True}):
             config = copy.deepcopy(load_config())
             config.update(updates)
             with tempfile.TemporaryDirectory() as directory:
@@ -73,11 +75,11 @@ class GeneralDeploymentTests(unittest.TestCase):
 
     def test_public_clients_need_explicit_opt_in(self):
         config = load_config()
-        config.update(allowed_clients=["8.8.8.8/32"], allow_public_clients=True)
+        config.update(allowed_clients=["203.0.113.7/32"], allow_public_clients=True)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(config))
-            self.assertEqual(load_config(path)["allowed_clients"], ["8.8.8.8/32"])
+            self.assertEqual(load_config(path)["allowed_clients"], ["203.0.113.7/32"])
 
     def test_config_rejects_wrong_types_and_invalid_test_urls(self):
         for updates in ({"no_proxy": "localhost"}, {"allowed_clients": {}},

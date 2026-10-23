@@ -100,13 +100,31 @@ def remove_path(path):
         shutil.rmtree(path)
 
 
+def vpn_interface():
+    """VPN device from the deployed runtime; empty when absent (no runtime
+    environment, e.g. a late rollback). firewall.sh applies the same rule."""
+    path = Path(os.environ.get("RK_VPN_RUNTIME", "/etc/rk-vpn-proxy/runtime.env"))
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VPN_INTERFACE="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
 def owned_policy_route(line):
     # Exact routes the firewall script writes into the routing table: the
     # mirrored metric-100 VPN default and the metric-200 unreachable fallback
-    # (IPv6 listings add "dev lo" and "pref medium" around the metric).
+    # (IPv6 listings add "dev lo" and "pref medium" around the metric). The
+    # VPN default must reference the configured VPN interface so a foreign
+    # service mirroring the metric signature through another device stays
+    # untouched; without a runtime the legacy signature alone is used.
     if line.startswith("unreachable default") and f" metric 200 " in f" {line} ":
         return True
-    return line.startswith("default ") and f" metric 100 " in f" {line} "
+    interface = vpn_interface()
+    return (line.startswith("default ") and f" metric 100 " in f" {line} "
+            and (not interface or f" dev {interface} " in f" {line} "))
 
 
 def policy_rules(family):
