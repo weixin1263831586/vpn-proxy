@@ -191,6 +191,12 @@ journalctl -u rk-vpn-proxy-health.service -n 30 --no-pager
 # 安装脚本下载服务
 systemctl status rk-vpn-proxy-installer.service
 
+# 客户端统计（一键入口,见仓库 client-stats.sh）
+sudo ./client-stats.sh          # 终端全屏实时面板,q 退出
+sudo ./client-stats.sh web      # 浏览器弹框面板(服务方式,Ctrl-C 停止)
+sudo ./client-stats.sh list     # 单次文本报表
+sudo ./client-stats.sh json     # 单次 JSON
+
 # 代理访问日志及出站规则
 sudo tail -f /var/log/rk-vpn-proxy/access.log
 sudo nft list table inet rk_vpn_proxy
@@ -205,6 +211,41 @@ sudo nft list table inet rk_vpn_proxy
 ```bash
 sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 ```
+
+### 客户端统计
+
+`rk-vpn-proxy-client-stats`（源码 `scripts/client_stats.py`）汇总当前接入的客户端信息，全程只读、不产生流量：
+
+- `ss` 读取代理端口上的已建立 TCP 连接：当前接入的客户端地址、各自持有的连接数。
+- Squid 访问日志统计时间窗（默认 300 秒，`--window` 可调）：每客户端的请求数、流量、错误数、最后活跃时间。
+- 客户端按 `allowed_clients` 网段归类；白名单外被拒绝的来源单独列出，便于发现误配。
+- `--json` 输出机器可读结果，可用于监控脚本；源码树运行可用 `--config`/`--log` 指定路径。
+
+**区分同一 IP 上的多个用户**（编译服务器场景）：配置 `"ident_lookup": true` 后，Squid 通过 RFC 1413 反查客户端机器的 ident 服务，日志记录发起连接的本地用户名，统计面板按 `用户@IP` 分别展示（如 `hcq@10.10.10.206`、`hjf@10.10.10.206`）。客户端机器需要运行 ident 守护进程：`sudo apt install oidentd`（默认配置即可， root 用户的连接会显示为 `root`）。未启用或客户端无 ident 服务时显示为 `-`，仍按 IP 聚合。
+
+需要 root：普通用户看不到其他进程的套接字，也读不了 0750 的代理日志。
+
+### 客户统计面板（Web UI）
+
+`stats_enabled` 默认开启（`stats_port` 默认 17898），安装后由 `rk-vpn-proxy-stats.service` 运行一个弹框式统计页面：打开即弹出居中对话框，每 5 秒自动刷新当前接入客户端、连接数与时间窗内的请求/流量/错误统计。
+
+终端里直接弹出实时面板（无需浏览器和隧道，按 q 退出）：
+
+```bash
+sudo ./client-stats.sh
+```
+
+等价于 `sudo /usr/local/libexec/rk-vpn-proxy-client-stats --tui`；脚本会自动把源码副本同步到部署路径，其他子命令：`web`（浏览器面板）、`list`（单次报表）、`json`（机器可读输出）。
+
+```bash
+# 面板只绑定主机的 127.0.0.1；通过 SSH 隧道在本地浏览器打开
+ssh -L 17898:127.0.0.1:17898 <user>@<proxy-host>
+# 然后访问 http://127.0.0.1:17898/
+```
+
+- 不监听外网地址、无需防火墙放行，统计信息默认仅服务器管理员可见；`stats_enabled=false` 可整体停用（停装 UFW 规则与服务）。
+- 手动启动（源码树或临时检查）：`sudo /usr/local/libexec/rk-vpn-proxy-client-stats --serve [--bind 127.0.0.1 --port 17898]`。
+- `GET /api/stats` 返回与 `--json` 相同的数据；页面与接口都只做读取，不改变代理状态。
 
 ### 验证
 

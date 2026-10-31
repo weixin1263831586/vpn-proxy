@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from configuration import load_config
 
 SERVICES = ["rk-vpn-proxy-installer.service", "rk-vpn-proxy-health.timer",
-            "rk-vpn-proxy-health.service", "rk-vpn-proxy.service", "rk-vpn-proxy-firewall.service"]
+            "rk-vpn-proxy-health.service", "rk-vpn-proxy.service", "rk-vpn-proxy-firewall.service",
+            "rk-vpn-proxy-stats.service"]
 FILES = ["/etc/rk-vpn-proxy", "/usr/local/lib/rk-vpn-proxy",
          "/usr/local/libexec/rk-vpn-proxy-firewall", "/usr/local/libexec/rk-vpn-proxy-health",
+         "/usr/local/libexec/rk-vpn-proxy-client-stats",
          "/etc/logrotate.d/rk-vpn-proxy"] + ["/etc/systemd/system/" + name for name in SERVICES]
 TAGS = {"rk-vpn-proxy", "rk-vpn-installer"}
 ROUTING_TABLE = os.environ.get("RK_VPN_ROUTING_TABLE", "240")
@@ -71,6 +73,8 @@ def sync_ufw(config_path):
             ports = [(config["proxy_port"], "rk-vpn-proxy")]
             if config["installer_enabled"]:
                 ports.append((config["installer_port"], "rk-vpn-installer"))
+            if config.get("stats_enabled", True):
+                ports.append((config.get("stats_port", 17898), "rk-vpn-stats"))
             for port, tag in ports:
                 desired.append(["allow", "from", source, "to", destination, "port", str(port),
                                 "proto", "tcp", "comment", tag])

@@ -85,10 +85,11 @@ install -m 0644 "$config_path" /etc/rk-vpn-proxy/config.json
 install -m 0644 "$build_dir/runtime.env" /etc/rk-vpn-proxy/runtime.env
 install -m 0755 "$source_dir/scripts/firewall.sh" /usr/local/libexec/rk-vpn-proxy-firewall
 install -m 0755 "$source_dir/scripts/health.sh" /usr/local/libexec/rk-vpn-proxy-health
+install -m 0755 "$source_dir/scripts/client_stats.py" /usr/local/libexec/rk-vpn-proxy-client-stats
 install -d -m 0755 /usr/local/lib/rk-vpn-proxy/build
 install -m 0644 "$source_dir/serve-installer.py" "$source_dir/configuration.py" /usr/local/lib/rk-vpn-proxy/
 install -m 0644 "$build_dir/client-install.sh" "$build_dir/client-install.ps1" /usr/local/lib/rk-vpn-proxy/build/
-for name in rk-vpn-proxy-firewall.service rk-vpn-proxy.service rk-vpn-proxy-health.service rk-vpn-proxy-health.timer rk-vpn-proxy-installer.service; do
+for name in rk-vpn-proxy-firewall.service rk-vpn-proxy.service rk-vpn-proxy-health.service rk-vpn-proxy-health.timer rk-vpn-proxy-installer.service rk-vpn-proxy-stats.service; do
     install -m 0644 "$source_dir/systemd/$name" "/etc/systemd/system/$name"
 done
 cat > /etc/logrotate.d/rk-vpn-proxy <<'EOF'
@@ -114,6 +115,11 @@ if [[ "$INSTALLER_ENABLED" == 1 ]]; then
     systemctl enable rk-vpn-proxy-installer.service
 else
     systemctl disable rk-vpn-proxy-installer.service 2>/dev/null || true
+fi
+if [[ "$STATS_PORT" != 0 ]]; then
+    systemctl enable rk-vpn-proxy-stats.service
+else
+    systemctl disable rk-vpn-proxy-stats.service 2>/dev/null || true
 fi
 systemctl restart rk-vpn-proxy-firewall.service
 systemctl restart rk-vpn-proxy.service
@@ -150,6 +156,27 @@ if [[ "$INSTALLER_ENABLED" == 1 ]]; then
 else
     systemctl stop rk-vpn-proxy-installer.service 2>/dev/null || true
     echo 'HTTP installer entry point disabled (installer_enabled=false).'
+fi
+if [[ "$STATS_PORT" == 0 ]]; then
+    systemctl stop rk-vpn-proxy-stats.service 2>/dev/null || true
+    echo 'Client statistics dashboard disabled (stats_enabled=false).'
+else
+    systemctl restart rk-vpn-proxy-stats.service
+    stats_ready=0
+    for attempt in {1..10}; do
+        if curl --silent --fail --noproxy '*' --max-time 3 \
+            "http://127.0.0.1:$STATS_PORT/api/stats" -o /dev/null; then
+            stats_ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $stats_ready == 1 ]]; then
+        echo "Client statistics dashboard ready on http://127.0.0.1:$STATS_PORT/ (SSH tunnel to view)."
+    else
+        echo 'Warning: client statistics dashboard did not answer its readiness check.' >&2
+        journalctl -u rk-vpn-proxy-stats.service -n 10 --no-pager >&2 || true
+    fi
 fi
 systemctl restart rk-vpn-proxy-health.timer
 # The deployment verdict is the proxy HTTPS and installer readiness checks above.

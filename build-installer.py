@@ -29,6 +29,12 @@ def render(config):
         if isinstance(value, list):
             value = " ".join(value)
         squid = squid.replace("@@" + key.upper() + "@@", str(value))
+    ident_block = ""
+    if config.get("ident_lookup"):
+        # Ask the source host's ident daemon who owns each connection, so a
+        # multi-user build server shows up as user@ip instead of one IP.
+        ident_block = "ident_lookup_access allow allowed_clients\n"
+    squid = squid.replace("@@IDENT_LOOKUP@@", ident_block)
     runtime = {
         "VPN_INTERFACE": config["vpn_interface"],
         "PROXY_BIND_ADDRESS": config["listen_host"],
@@ -36,6 +42,7 @@ def render(config):
         "HEALTH_PORT": config["health_port"],
         "INSTALLER_PORT": config["installer_port"],
         "INSTALLER_ENABLED": int(config["installer_enabled"]),
+        "STATS_PORT": config.get("stats_port", 17898) if config.get("stats_enabled", True) else 0,
         "ALLOWED_CLIENTS": " ".join(config["allowed_clients"]),
         "DNS_CHECK_ADDRESS": config["dns_nameservers"][0],
         "PROXY_TEST_URL": config["test_url"],

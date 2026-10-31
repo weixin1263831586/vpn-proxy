@@ -25,8 +25,6 @@ def load_config(path=None):
     for key in ("proxy_port", "health_port", "installer_port"):
         if type(config.get(key)) is not int or not 1 <= config[key] <= 65535:
             raise ValueError(f"Invalid {key}")
-    if len({config[key] for key in ("proxy_port", "health_port", "installer_port")}) != 3:
-        raise ValueError("Proxy, health and installer ports must differ")
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", config["vpn_interface"]):
         raise ValueError("Invalid VPN interface name")
     networks = [ipaddress.ip_network(value, strict=False) for value in config["allowed_clients"]]
@@ -36,6 +34,18 @@ def load_config(path=None):
         raise ValueError("allow_public_clients must be a boolean")
     if type(config.get("installer_enabled", False)) is not bool:
         raise ValueError("installer_enabled must be a boolean")
+    if type(config.get("stats_enabled", True)) is not bool:
+        raise ValueError("stats_enabled must be a boolean")
+    if type(config.get("ident_lookup", False)) is not bool:
+        raise ValueError("ident_lookup must be a boolean")
+    config["ident_lookup"] = config.get("ident_lookup", False)
+    ports = {key: config[key] for key in ("proxy_port", "health_port", "installer_port")}
+    if config.get("stats_enabled", True):
+        if type(config.get("stats_port", 17898)) is not int or not 1 <= config.get("stats_port", 17898) <= 65535:
+            raise ValueError("Invalid stats_port")
+        ports["stats_port"] = config.get("stats_port", 17898)
+    if len(set(ports.values())) != len(ports):
+        raise ValueError("Proxy, health, installer and stats ports must differ")
     private_ranges = [ipaddress.ip_network(value) for value in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")]
     for network in networks:

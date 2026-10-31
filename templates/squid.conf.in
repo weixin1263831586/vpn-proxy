@@ -2,6 +2,10 @@
 http_port @@LISTEN_HOST@@:@@PROXY_PORT@@
 http_port 127.0.0.1:@@HEALTH_PORT@@
 acl allowed_clients src @@ALLOWED_CLIENTS@@
+# %un records the RFC 1413 (ident) owner of the connection when
+# ident_lookup is enabled and the client runs an ident daemon; otherwise "-".
+logformat rk_vpn %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %un %ru
+@@IDENT_LOOKUP@@
 acl health_client src 127.0.0.1/32
 acl health_listener localip 127.0.0.1
 acl SSL_ports port 443
@@ -27,7 +31,7 @@ dns_nameservers @@DNS_NAMESERVERS@@
 cache deny all
 cache_mem 32 MB
 maximum_object_size_in_memory 0 KB
-access_log stdio:/var/log/rk-vpn-proxy/access.log squid
+access_log stdio:/var/log/rk-vpn-proxy/access.log rk_vpn
 cache_log /var/log/rk-vpn-proxy/cache.log
 cache_store_log none
 # External logrotate renames files; USR1 only reopens them.
