@@ -122,12 +122,13 @@ def set_access(action: str, client: str) -> dict:
     client = ip_value(client)
     if not CONFIGFILE.is_file() or not SQUIDFILE.is_file():
         raise ValueError("vpn-proxy must be installed before client control")
-    config = json.loads(CONFIGFILE.read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or not allowed(client, config):
-        raise ValueError("Client does not belong to an authorized network")
-
     with DEPLOY_LOCK.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Read the deployed allowlist only after taking the same lock used by
+        # install.sh, so a concurrent redeploy cannot replace our policy.
+        config = json.loads(CONFIGFILE.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not allowed(client, config):
+            raise ValueError("Client does not belong to an authorized network")
         old = read_disabled()
         updated = set(old)
         if action == "disable":

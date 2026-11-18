@@ -372,7 +372,24 @@ done
 ip route show table 240 | grep -F 'via 203.0.114.1' || {
     echo 'FAIL: watch daemon did not mirror the rebuilt VPN default route.' >&2; exit 1;
 }
-bash "$source_dir/scripts/firewall.sh" --check
-probe
-proxy_probe
+# The guard may update policy routing before Squid has reopened its
+# upstream sockets after the veth re-enumeration. Require all three gates to
+# stabilize; never skip the firewall integrity or real HTTP forward probe.
+recovery_ready=0
+for attempt in {1..60}; do
+    if bash "$source_dir/scripts/firewall.sh" --check >/dev/null 2>&1 &&
+        probe >/dev/null 2>&1 && proxy_probe >/dev/null 2>&1; then
+        recovery_ready=1
+        break
+    fi
+    sleep 0.2
+done
+if [[ "$recovery_ready" != 1 ]]; then
+    echo 'FAIL: firewall, direct VPN route or Squid HTTP forwarding did not recover.' >&2
+    bash "$source_dir/scripts/firewall.sh" --check >&2 || true
+    ip route show table 240 >&2 || true
+    systemctl status "$guard_unit" "$proxy_unit" --no-pager >&2 || true
+    journalctl -u "$guard_unit" -u "$proxy_unit" -n 80 --no-pager >&2 || true
+    exit 1
+fi
 echo 'PASS: VPN interface rebuild with a new gateway stays blocked and self-heals.'
