@@ -75,6 +75,17 @@ class ConnectionParsing(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "boom"):
             CS.established_connections(7897, run=run)
 
+    def test_socket_collection_timeout_is_reported_as_unavailable(self):
+        def run(args, **kwargs):
+            self.assertEqual(kwargs.get("timeout"), 3)
+            raise subprocess.TimeoutExpired(args, 3)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text("", encoding="utf-8")
+            snapshot = CS.collect(CONFIG, log, 300, run=run, now=NOW)
+        self.assertFalse(snapshot["sources"]["connections"])
+        self.assertTrue(snapshot["sources"]["access_log"])
+
     def test_output_without_timer_column_is_parsed(self):
         def run(args, **kwargs):
             return subprocess.CompletedProcess(args, 0, SS_OUTPUT_NO_TIMER, "")
@@ -84,7 +95,10 @@ class ConnectionParsing(unittest.TestCase):
 
 class AccessLogParsing(unittest.TestCase):
     def test_window_totals_stop_at_the_boundary(self):
-        clients = CS.parse_access_log("/dev/null", NOW - 60, run=fake_run(LOG_LINES))
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text(LOG_LINES, encoding="utf-8")
+            clients = CS.parse_access_log(log, NOW - 60)
         # Same IP with different ident users aggregates separately.
         self.assertEqual(clients[("10.0.0.15", "hcq")],
                          {"client": "10.0.0.15", "user": "hcq",
@@ -96,17 +110,45 @@ class AccessLogParsing(unittest.TestCase):
 
     def test_non_numeric_byte_counts_are_counted_but_zero(self):
         lines = f"{NOW - 5:.3f} 10 10.0.0.1 TCP_MISS/200 - GET - http://a/"
-        clients = CS.parse_access_log("/dev/null", NOW - 60, run=fake_run(lines))
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text(lines, encoding="utf-8")
+            clients = CS.parse_access_log(log, NOW - 60)
         self.assertEqual(clients[("10.0.0.1", None)]["bytes"], 0)
         self.assertEqual(clients[("10.0.0.1", None)]["requests"], 1)
 
 
+class ReverseLogReader(unittest.TestCase):
+    def test_crosses_block_boundaries_and_stops_at_old_entries(self):
+        recent = f"{NOW - 2:.3f} 10 10.0.0.1 TCP_MISS/200 512 GET - https://new.example/"
+        old = f"{NOW - 3600:.3f} 10 10.0.0.2 TCP_MISS/200 4096 GET - https://old.example/"
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text(old + "\n" + ("bad row\n" * 12) + recent + "\n",
+                           encoding="utf-8")
+            lines = list(CS.reverse_log_lines(log, block_size=17))
+            self.assertEqual(lines[0], recent)
+            self.assertEqual(lines[-1], old)
+            snapshot = CS.parse_access_log(log, NOW - 60)
+            self.assertEqual(snapshot[("10.0.0.1", None)]["bytes"], 512)
+            self.assertNotIn(("10.0.0.2", None), snapshot)
+
+    def test_oversized_log_line_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_bytes(b"x" * (CS.MAX_LOG_LINE_SIZE + 1))
+            with self.assertRaisesRegex(ValueError, "oversized line"):
+                list(CS.reverse_log_lines(log))
+
+
 class Snapshot(unittest.TestCase):
     def test_collect_classifies_connected_recent_and_unlisted(self):
-        run = fake_run(LOG_LINES)
-        with patch.object(CS, "established_connections",
-                          return_value={"10.0.0.15": 2, "172.16.8.9": 1}):
-            snapshot = CS.collect(CONFIG, "/dev/null", 300, run, now=NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text(LOG_LINES, encoding="utf-8")
+            with patch.object(CS, "established_connections",
+                              return_value={"10.0.0.15": 2, "172.16.8.9": 1}):
+                snapshot = CS.collect(CONFIG, log, 300, now=NOW)
         self.assertEqual([entry["client"] for entry in snapshot["connected"]],
                          ["10.0.0.15", "172.16.8.9"])
         self.assertEqual(snapshot["connected"][0]["network"], "10.0.0.0/8")
@@ -119,7 +161,7 @@ class Snapshot(unittest.TestCase):
     def test_unavailable_sources_degrade_to_empty_sections(self):
         with patch.object(CS, "established_connections",
                           side_effect=RuntimeError("no ss")):
-            snapshot = CS.collect(CONFIG, "/dev/null", 300, now=NOW,
+            snapshot = CS.collect(CONFIG, "/does-not-exist/access.log", 300, now=NOW,
                                   run=lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "x"))
         self.assertEqual(snapshot["connected"], [])
         self.assertEqual(snapshot["recent"], [])
@@ -128,8 +170,11 @@ class Snapshot(unittest.TestCase):
         self.assertIn("run as root", text)
 
     def test_render_marks_denied_sources(self):
-        with patch.object(CS, "established_connections", return_value={}):
-            snapshot = CS.collect(CONFIG, "/dev/null", 300, run=fake_run(LOG_LINES), now=NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "access.log"
+            log.write_text(LOG_LINES, encoding="utf-8")
+            with patch.object(CS, "established_connections", return_value={}):
+                snapshot = CS.collect(CONFIG, log, 300, now=NOW)
         text = CS.render(snapshot, "/dev/null")
         self.assertIn("Sources outside allowed_clients (denied): 203.0.113.9 (1)", text)
         self.assertIn("Summary: 0 connected", text)
@@ -193,9 +238,14 @@ class Dashboard(unittest.TestCase):
                         with urllib.request.urlopen(
                                 f"http://127.0.0.1:{port}/api/stats", timeout=2) as response:
                             api = json.loads(response.read().decode())
-                        break
+                        # The first response may be "尚未采集" while the worker
+                        # thread gathers the initial snapshot. Do not call
+                        # that a ready statistics service.
+                        if "proxy_port" in api and api.get("sources"):
+                            break
                     except Exception:
-                        time.sleep(0.2)
+                        pass
+                    time.sleep(0.2)
                 self.assertIsNotNone(page, "dashboard did not start")
                 self.assertIsNotNone(api, "api did not answer")
                 # The dialog-style UI: single page, centered <dialog>, auto refresh.
@@ -210,6 +260,40 @@ class Dashboard(unittest.TestCase):
             finally:
                 server.terminate()
                 server.wait(timeout=10)
+
+    def test_rebinding_host_is_rejected(self):
+        import urllib.error
+        import urllib.request
+        with tempfile.TemporaryDirectory() as directory:
+            port = 18733
+            server = self.start_server(directory, port)
+            try:
+                for _ in range(50):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/", timeout=2)
+                        break
+                    except Exception:
+                        time.sleep(0.2)
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/stats",
+                    headers={"Host": "attacker.example"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 403)
+            finally:
+                server.terminate()
+                server.wait(timeout=10)
+
+    def test_non_loopback_bind_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/client_stats.py"),
+                "--serve", "--bind", "0.0.0.0", "--port", "0",
+                "--config", str(Main.write_config(directory)),
+            ], capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("127.0.0.1", result.stderr)
 
     def test_unknown_paths_are_rejected(self):
         import urllib.error

@@ -227,6 +227,11 @@ sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 
 ### 客户统计面板（Web UI）
 
+统计采集针对 Squid access.log 使用逆向块读取，仅扫描最近请求窗口，
+不再每 5 秒通过 `cat` 加载整个日志。直接运行源码树的
+`client-stats.sh` 不会覆盖已部署的 `/usr/local/libexec/rk-vpn-proxy-client-stats`；
+修改代码后仍需正式执行 `sudo bash install.sh` 才能更新 systemd 运行副本。
+
 `stats_enabled` 默认开启（`stats_port` 默认 17898），安装后由 `rk-vpn-proxy-stats.service` 运行一个弹框式统计页面：打开即弹出居中对话框，每 5 秒自动刷新当前接入客户端、连接数与时间窗内的请求/流量/错误统计。
 
 终端里直接弹出实时面板（无需浏览器和隧道，按 q 退出）：
@@ -235,7 +240,7 @@ sudo systemctl restart rk-vpn-proxy-firewall.service rk-vpn-proxy.service
 sudo ./client-stats.sh
 ```
 
-等价于 `sudo /usr/local/libexec/rk-vpn-proxy-client-stats --tui`；脚本会自动把源码副本同步到部署路径，其他子命令：`web`（浏览器面板）、`list`（单次报表）、`json`（机器可读输出）。
+执行工作区的 `scripts/client_stats.py --tui`，不会覆盖已部署程序；正式服务仍使用 `sudo bash install.sh` 安装的运行副本。其他子命令：`web`（浏览器面板）、`list`（单次报表）、`json`（机器可读输出）。
 
 ```bash
 # 面板只绑定主机的 127.0.0.1；通过 SSH 隧道在本地浏览器打开
@@ -311,3 +316,24 @@ sudo flock /run/lock/rk-vpn-proxy-deploy.lock python3 -B scripts/deployment.py r
 ```bash
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 ```
+
+
+### 单客户端禁用 / 恢复（GMS 管理弹框）
+
+安装新版后，会在 Squid 的 `allowed_clients` 之前执行 `disabled_clients` ACL。
+只有已属于允许网段的**明确 IP**才能被单独禁用；已授权网段和防火墙 kill-switch 均保持不变。
+禁用后会热加载 Squid 配置，阻止该地址的新请求；已建立的长连接可能直到结束才断开。
+禁用清单持久保存在 root 管理的 `/etc/rk-vpn-proxy/disabled_clients.json`，升级部署时自动重新应用。
+
+```bash
+sudo /usr/local/libexec/rk-vpn-proxy-client-control disable 172.16.14.66
+sudo /usr/local/libexec/rk-vpn-proxy-client-control enable 172.16.14.66
+```
+
+GMS Controller 的管理员二次验证后才可调用这些操作。只允许使用安装后的 root-owned
+`/usr/local/libexec/rk-vpn-proxy-client-control`；不得为 GMS 进程赋予任意 `squid`、`systemctl`
+或编辑 `/etc` 的权限。最小 sudoers 规则可分别限定 helper 的 `enable` / `disable` 动作，
+输入通过 GMS API 和 helper 本身双重校验。
+
+该开关以**源 IP**为粒度，NAT 后多个用户共享同一 IP 时会一起受影响；
+不会断开设备 VPN、修改 Windows/Ubuntu 系统代理，也不能替代身份认证。

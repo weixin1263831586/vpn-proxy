@@ -2,6 +2,9 @@
 http_port @@LISTEN_HOST@@:@@PROXY_PORT@@
 http_port 127.0.0.1:@@HEALTH_PORT@@
 acl allowed_clients src @@ALLOWED_CLIENTS@@
+# rk-vpn-client-control BEGIN
+acl disabled_clients src 0.0.0.0/32
+# rk-vpn-client-control END
 # %un records the RFC 1413 (ident) owner of the connection when
 # ident_lookup is enabled and the client runs an ident daemon; otherwise "-".
 logformat rk_vpn %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %un %ru
@@ -22,6 +25,8 @@ http_access deny to_localhost
 http_access deny to_linklocal
 http_access deny blocked_private
 http_access allow health_client health_listener
+# This deny takes precedence over the broader permitted client CIDRs.
+http_access deny disabled_clients
 http_access allow allowed_clients
 http_access deny all
 

@@ -19,6 +19,7 @@ SERVICES = ["rk-vpn-proxy-installer.service", "rk-vpn-proxy-health.timer",
 FILES = ["/etc/rk-vpn-proxy", "/usr/local/lib/rk-vpn-proxy",
          "/usr/local/libexec/rk-vpn-proxy-firewall", "/usr/local/libexec/rk-vpn-proxy-health",
          "/usr/local/libexec/rk-vpn-proxy-client-stats",
+         "/usr/local/libexec/rk-vpn-proxy-client-control",
          "/etc/logrotate.d/rk-vpn-proxy"] + ["/etc/systemd/system/" + name for name in SERVICES]
 TAGS = {"rk-vpn-proxy", "rk-vpn-installer"}
 ROUTING_TABLE = os.environ.get("RK_VPN_ROUTING_TABLE", "240")

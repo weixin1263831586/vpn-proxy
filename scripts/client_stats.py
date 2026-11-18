@@ -43,7 +43,8 @@ DEPLOYED_CONFIG = "/etc/rk-vpn-proxy/config.json"
 def established_connections(proxy_port, run=subprocess.run):
     """Count established TCP peers per client address for one listen port."""
     result = run(["ss", "-Htno", "state", "established"],
-                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                 timeout=3)
     clients: dict = {}
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ss failed")
@@ -92,20 +93,44 @@ def peer_address(endpoint):
     return address
 
 
-def parse_access_log(path, since, run=subprocess.run):
-    """Per-client totals from the rk_vpn access log, newest first.
+LOG_BLOCK_SIZE = 64 * 1024
+MAX_LOG_LINE_SIZE = 1024 * 1024
 
-    Line layout: <epoch> <elapsed_ms> <client> <code>/<status> <bytes>
-    <method> <user> <uri> — the user field is "-" unless ident lookup or
-    authentication fills it. Entries older than `since` stop the scan; the
-    log is rotated daily, so the newest lines are always near the end.
+
+def reverse_log_lines(path, block_size=LOG_BLOCK_SIZE):
+    """Read Squid lines newest first without copying the entire access log.
+
+    The daemon samples every five seconds. A whole-file `cat` used to load
+    rotated-size logs into RAM on every poll even when the requested window
+    contained only a few trailing lines. Read backwards in bounded blocks and
+    stop as soon as the first record predates the time window.
     """
-    result = run(["cat", str(path)], stdout=subprocess.PIPE,
-                 stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"cannot read {path}")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        remaining = handle.tell()
+        pending = b""
+        while remaining:
+            length = min(remaining, block_size)
+            remaining -= length
+            handle.seek(remaining)
+            data = handle.read(length)
+            parts = (data + pending).split(b"\n")
+            pending = parts[0]
+            if len(pending) > MAX_LOG_LINE_SIZE:
+                raise ValueError("Squid access log contains an oversized line")
+            for raw in reversed(parts[1:]):
+                if raw:
+                    yield raw.decode("utf-8", errors="replace")
+        if pending:
+            yield pending.decode("utf-8", errors="replace")
+
+
+def parse_access_log(path, since):
+    """Summarize the Squid access-log window without loading older entries."""
     clients: dict = {}
-    for line in reversed(result.stdout.splitlines()):
+    for line in reverse_log_lines(path):
         fields = line.split()
         if len(fields) < 5:
             continue
@@ -128,7 +153,6 @@ def parse_access_log(path, since, run=subprocess.run):
             entry["errors"] += 1
         entry["last_seen"] = max(entry["last_seen"], stamp)
     return clients
-
 
 def client_network(address, networks):
     """Canonical allowed_clients network covering the address, if any."""
@@ -159,11 +183,11 @@ def collect(config, log_path, window, run=subprocess.run, now=None):
         now = time.time()
     try:
         connected = established_connections(proxy_port, run)
-    except (RuntimeError, FileNotFoundError):
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
         connected = None
     try:
-        recent = parse_access_log(log_path, now - window, run)
-    except (RuntimeError, FileNotFoundError):
+        recent = parse_access_log(log_path, now - window)
+    except (OSError, RuntimeError, ValueError):
         recent = None
 
     def decorate(address, extra):
@@ -314,26 +338,43 @@ async function refresh() {
   try {
     const r = await fetch('/api/stats', {cache: 'no-store'});
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    render(await r.json());
-    document.getElementById('status').className = 'badge on';
-    document.getElementById('status').textContent = '正常';
+    const snapshot = await r.json();
+    // Collection can retain separate socket/log failures; report them
+    // separately and never present an old snapshot as live.
+    if (!snapshot || snapshot.failed || snapshot.error ||
+        !Number.isFinite(Number(snapshot.time)) ||
+        Math.abs(Date.now() / 1000 - Number(snapshot.time)) > 45 ||
+        !snapshot.sources || !Array.isArray(snapshot.connected) ||
+        !Array.isArray(snapshot.recent) || !Array.isArray(snapshot.unlisted))
+      throw new Error('统计快照不可用或已过期');
+    render(snapshot);
+    const sources = snapshot.sources;
+    const bothHealthy = sources.connections === true && sources.access_log === true;
+    document.getElementById('status').className = bothHealthy ? 'badge on' : 'badge off';
+    document.getElementById('status').textContent = bothHealthy ? '正常' : '部分数据源不可用';
   } catch (e) {
     document.getElementById('status').className = 'badge off';
-    document.getElementById('status').textContent = '刷新失败';
+    document.getElementById('status').textContent = '统计不可用';
+    document.getElementById('updated').textContent = '无法确认实时状态';
+    document.getElementById('content').textContent = '统计读取失败或数据已过期；请检查统计服务。';
   }
 }
 function render(s) {
   document.getElementById('updated').textContent =
       '更新于 ' + new Date(s.time * 1000).toLocaleTimeString();
   document.getElementById('window').textContent = s.window_seconds;
-  const rows = (list, cols) => list.length ? list.map(e =>
+  const rows = (list, cols, empty) => list.length ? list.map(e =>
       '<tr>' + cols.map(c => '<td' + (c.num ? ' class="num"' : '') + '>' +
           (c.render ? c.render(e[c.key]) : esc(e[c.key])) + '</td>').join('') + '</tr>').join('')
-      : '<tr><td colspan="6" class="empty">（无）</td></tr>';
+      : '<tr><td colspan="' + cols.length + '" class="empty">' + esc(empty) + '</td></tr>';
   const connCols = [
       {key: 'client'}, {key: 'connections', num: 1},
       {key: 'network'}];
-  const hasUsers = s.recent.some(e => e.user);
+  const connAvailable = s.sources.connections === true;
+  const logAvailable = s.sources.access_log === true;
+  const connList = connAvailable ? s.connected : [];
+  const logList = logAvailable ? s.recent : [];
+  const hasUsers = logList.some(e => e.user);
   const logCols = [
       {key: hasUsers ? 'label' : 'client'},
       {key: 'requests', num: 1},
@@ -342,15 +383,18 @@ function render(s) {
       {key: 'last_seen', render: t => new Date(t * 1000).toLocaleTimeString()},
       {key: 'network'}];
   document.getElementById('content').innerHTML =
-      '<h2>当前接入（端口 ' + s.proxy_port + '，共 ' + s.connected.length + ' 个客户端）</h2>' +
+      '<h2>当前接入（' + (connAvailable
+        ? '端口 ' + s.proxy_port + '，共 ' + connList.length + ' 个客户端'
+        : '套接字统计不可用') + '）</h2>' +
       '<table><thead><tr><th>客户端</th><th class="num">连接数</th><th>网段</th></tr></thead><tbody>' +
-      rows(s.connected, connCols) + '</tbody></table>' +
-      '<h2>最近 ' + s.window_seconds + ' 秒活跃（共 ' + s.recent.length + ' 个客户端）</h2>' +
+      rows(connList, connCols, connAvailable ? '（无）' : '套接字数据不可用') + '</tbody></table>' +
+      '<h2>最近 ' + s.window_seconds + ' 秒活跃（' +
+      (logAvailable ? '共 ' + logList.length + ' 个客户端' : '访问日志不可用') + '）</h2>' +
       '<table><thead><tr><th>' + (hasUsers ? '客户端（用户@IP）' : '客户端') + '</th>' +
       '<th class="num">请求</th><th class="num">流量</th>' +
       '<th class="num">错误</th><th>最后活跃</th><th>网段</th></tr></thead><tbody>' +
-      rows(s.recent, logCols) + '</tbody></table>' +
-      (s.unlisted.length ? '<p class="denied">白名单外被拒来源：' +
+      rows(logList, logCols, logAvailable ? '（无）' : '访问日志数据不可用') + '</tbody></table>' +
+      (logAvailable && s.unlisted.length ? '<p class="denied">白名单外被拒来源：' +
           s.unlisted.map(e => esc(e.client) + '（' + e.requests + '）').join('、') + '</p>' : '');
 }
 refresh();
@@ -366,6 +410,14 @@ def dashboard_handler(factory):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            # The dashboard is unauthenticated and loopback-only. Reject
+            # rebinding domains even if they resolve to 127.0.0.1.
+            port = self.server.server_port
+            allowed_hosts = {"127.0.0.1", "localhost",
+                             f"127.0.0.1:{port}", f"localhost:{port}"}
+            if self.headers.get("Host", "").strip().lower() not in allowed_hosts:
+                self.send_error(403, "Invalid Host header")
+                return
             path = urlparse(self.path).path
             if path == "/api/stats":
                 body = json.dumps(factory()).encode()
@@ -383,6 +435,8 @@ def dashboard_handler(factory):
             # read the client statistics.
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
@@ -564,6 +618,8 @@ def run_tui(config, log_path, window):
 
 def serve(config, log_path, window, bind, port):
     """Run the dashboard; snapshots are rendered off the accept loop."""
+    if bind != "127.0.0.1":
+        raise ValueError("Statistics listener must bind to 127.0.0.1")
     state = {"error": "尚未采集"}
     lock = threading.Lock()
 
@@ -571,9 +627,13 @@ def serve(config, log_path, window, bind, port):
         while True:
             try:
                 snapshot = collect(config, log_path, window)
-            except Exception as error:  # keep the last good data visible
+            except Exception:
+                # Never serve the previous successful snapshot as fresh on
+                # collector failure; the GMS bridge also checks 'failed'.
                 with lock:
-                    state.update({"error": str(error), "failed": True})
+                    state.clear()
+                    state.update({"error": "statistics collection failed",
+                                  "failed": True, "time": time.time()})
             else:
                 with lock:
                     state.clear()

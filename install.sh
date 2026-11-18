@@ -86,6 +86,11 @@ install -m 0644 "$build_dir/runtime.env" /etc/rk-vpn-proxy/runtime.env
 install -m 0755 "$source_dir/scripts/firewall.sh" /usr/local/libexec/rk-vpn-proxy-firewall
 install -m 0755 "$source_dir/scripts/health.sh" /usr/local/libexec/rk-vpn-proxy-health
 install -m 0755 "$source_dir/scripts/client_stats.py" /usr/local/libexec/rk-vpn-proxy-client-stats
+# Install the root-owned access-control helper; it is never writable by GMS.
+install -m 0755 "$source_dir/scripts/client_control.py" /usr/local/libexec/rk-vpn-proxy-client-control
+# Re-apply explicit client disables saved from the previous deployment before
+# parsing/restarting Squid. This is inside install.sh's rollback transaction.
+python3 -B /usr/local/libexec/rk-vpn-proxy-client-control sync
 install -d -m 0755 /usr/local/lib/rk-vpn-proxy/build
 install -m 0644 "$source_dir/serve-installer.py" "$source_dir/configuration.py" /usr/local/lib/rk-vpn-proxy/
 install -m 0644 "$build_dir/client-install.sh" "$build_dir/client-install.ps1" /usr/local/lib/rk-vpn-proxy/build/

@@ -18,6 +18,7 @@ leak_pid=''
 systemd_test=${2:-}
 guard_unit="rk-vpn-test-$$-guard.service"
 proxy_unit="rk-vpn-test-$$-proxy.service"
+transient_generation=0
 test_dir=$(mktemp -d)
 chmod 0755 "$test_dir"
 VPN_INTERFACE=rk-test-vpn
@@ -132,11 +133,28 @@ if runuser -u rk-vpn-proxy -- ip -6 route get 2001:db8::1 >/dev/null 2>&1; then
     exit 1
 fi
 echo 'PASS: 11 client rules keep distinct ordered preferences; IPv6 egress is unreachable for the proxy UID.'
-if [[ "$systemd_test" == --systemd ]]; then
+start_proxy() {
     systemd-run --quiet --unit="$proxy_unit" --property="BindsTo=$guard_unit" --property="After=$guard_unit" \
         --property=User=rk-vpn-proxy --property=Restart=always \
         --property="NetworkNamespacePath=/proc/$$/ns/net" \
         /usr/sbin/squid -N -n rkvpntest -f "$test_dir/build/squid.conf"
+}
+restart_transient_pair() {
+    # systemd-run creates transient units. When BindsTo stops the proxy after
+    # a guard failure, systemd garbage-collects those units; systemctl start
+    # cannot resurrect an unloaded transient definition.
+    # The old guard may still be running after the nftables leak gate; stop
+    # both old units before it can race with the newly applied firewall rules.
+    systemctl stop "$proxy_unit" "$guard_unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$proxy_unit" "$guard_unit" >/dev/null 2>&1 || true
+    transient_generation=$((transient_generation + 1))
+    guard_unit="rk-vpn-test-$$-$transient_generation-guard.service"
+    proxy_unit="rk-vpn-test-$$-$transient_generation-proxy.service"
+    start_guard
+    start_proxy
+}
+if [[ "$systemd_test" == --systemd ]]; then
+    start_proxy
 else
     runuser -u rk-vpn-proxy -- squid -N -n rkvpntest -f "$test_dir/build/squid.conf" > "$test_dir/squid.log" 2>&1 &
     proxy_pid=$!
@@ -156,11 +174,22 @@ proxy_probe() {
         --max-time 5 http://1.1.1.1/ -o /dev/null
 }
 proxy_ready=0
-for attempt in {1..50}; do
+# A transient systemd unit can take longer than 5 seconds to become ready on
+# busy hosted runners. Show the correct diagnostic source on failure.
+for attempt in {1..75}; do
     if proxy_probe 2>/dev/null; then proxy_ready=1; break; fi
-    sleep 0.1
+    sleep 0.2
 done
-[[ "$proxy_ready" == 1 ]] || { cat "$test_dir/squid.log"; exit 1; }
+if [[ "$proxy_ready" != 1 ]]; then
+    echo 'FAIL: isolated Squid was not ready for HTTP forwarding.' >&2
+    if [[ "$systemd_test" == --systemd ]]; then
+        systemctl status "$guard_unit" "$proxy_unit" --no-pager >&2 || true
+        journalctl -u "$guard_unit" -u "$proxy_unit" -n 80 --no-pager >&2 || true
+    else
+        cat "$test_dir/squid.log" >&2 || true
+    fi
+    exit 1
+fi
 echo 'PASS: actual Squid startup and HTTP forwarding.'
 ip link set "$VPN_INTERFACE" down
 ip route get 1.1.1.1 | grep -F "dev $fallback_interface"
@@ -214,7 +243,7 @@ nft flush chain inet rk_vpn_proxy proxy_egress
 assert_guard_failed
 echo 'PASS: modified rules fail the guard and clear FIREWALL_ENFORCED.'
 if [[ "$systemd_test" == --systemd ]]; then
-    systemctl start "$guard_unit" "$proxy_unit"
+    restart_transient_pair
 else
     start_guard
 fi
@@ -229,7 +258,7 @@ if [[ "$systemd_test" == --systemd ]]; then
     # Zero-leak gates: with the second policy-routing layer in place, BOTH a
     # plain VPN loss and full deletion of the nftables table must forward zero
     # requests through the fallback interface. Any non-zero count fails CI.
-    systemctl start "$guard_unit" "$proxy_unit"
+    restart_transient_pair
     leak_ready=0
     for attempt in {1..50}; do
         if proxy_probe 2>/dev/null; then leak_ready=1; break; fi
@@ -290,7 +319,7 @@ fi
 ip link set "$VPN_INTERFACE" up
 ip route replace default via 203.0.113.1 dev "$VPN_INTERFACE" metric 50
 if [[ "$systemd_test" == --systemd ]]; then
-    systemctl start "$guard_unit" "$proxy_unit"
+    restart_transient_pair
 else
     start_guard
 fi
@@ -299,7 +328,16 @@ for attempt in {1..50}; do
     if proxy_probe 2>/dev/null; then proxy_ready=1; break; fi
     sleep 0.1
 done
-[[ "$proxy_ready" == 1 ]] || { echo 'FAIL: proxy did not restart for the routing self-heal check.' >&2; exit 1; }
+if [[ "$proxy_ready" != 1 ]]; then
+    echo 'FAIL: proxy did not restart for the routing self-heal check.' >&2
+    if [[ "$systemd_test" == --systemd ]]; then
+        systemctl status "$guard_unit" "$proxy_unit" --no-pager >&2 || true
+        journalctl -u "$guard_unit" -u "$proxy_unit" -n 80 --no-pager >&2 || true
+    fi
+    ip route show table 240 >&2 || true
+    nft list table inet rk_vpn_proxy >&2 || true
+    exit 1
+fi
 proxy_uid=$(id -u rk-vpn-proxy)
 if ! ip rule del uidrange "$proxy_uid-$proxy_uid" lookup 240 2>/dev/null; then
     echo 'FAIL: expected a policy routing rule to delete.' >&2; exit 1
