@@ -221,7 +221,7 @@ class Dashboard(unittest.TestCase):
              "--serve", "--bind", "127.0.0.1", "--port", str(port),
              "--log", str(log), "--config", str(Main.write_config(directory)),
              "--window", "60"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
 
     def test_dashboard_serves_html_and_fresh_json(self):
         import urllib.request

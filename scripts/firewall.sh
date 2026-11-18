@@ -202,7 +202,7 @@ ensure_uid_rules() {
             *" to "*" $uid_selector lookup main")
                 network=${rest#*" to "}
                 network=${network%% *}
-                if ! client_networks_for_family "$family" | grep -qxF "$network"; then
+                if ! client_networks_for_family "$family" | grep -xF "$network" >/dev/null; then
                     ip -"$family" rule del pref "$pref" $rest 2>/dev/null || true
                 elif [[ "$pref" -gt "$max_client" ]]; then
                     max_client=$pref
@@ -211,7 +211,7 @@ ensure_uid_rules() {
     done < <(owned_rules "$family")
     while read -r network; do
         [[ -z "$network" ]] && continue
-        if ! owned_rules "$family" | grep -qF "to $network $uid_selector lookup main"; then
+        if ! owned_rules "$family" | grep -F "to $network $uid_selector lookup main" >/dev/null; then
             missing_clients+=("$network")
         fi
     done < <(client_networks_for_family "$family")
@@ -271,13 +271,13 @@ check_policy_routing() {
                 *" to "*" $uid_selector lookup main")
                     network=${rest#*" to "}
                     network=${network%% *}
-                    client_networks_for_family "$family" | grep -qxF "$network" || return 1 ;;
+                    client_networks_for_family "$family" | grep -xF "$network" >/dev/null || return 1 ;;
                 *) return 1 ;;
             esac
         done < <(owned_rules "$family")
         [[ "$base_count" == 1 ]] || return 1
         [[ -n "$base_pref" ]] || return 1
-        ip -"$family" route show table "$routing_table" 2>/dev/null | grep -qF 'unreachable default' || return 1
+        ip -"$family" route show table "$routing_table" 2>/dev/null | grep -F 'unreachable default' >/dev/null || return 1
         while read -r network; do
             [[ -z "$network" ]] && continue
             line=$(owned_rules "$family" | grep -F "to $network $uid_selector lookup main") || return 1
@@ -286,7 +286,7 @@ check_policy_routing() {
         done < <(client_networks_for_family "$family")
         mirrored=$(ip -"$family" route show default dev "$VPN_INTERFACE" 2>/dev/null || true)
         if [[ -n "$mirrored" ]]; then
-            ip -"$family" route show table "$routing_table" | grep -qF "dev $VPN_INTERFACE" || return 1
+            ip -"$family" route show table "$routing_table" | grep -F "dev $VPN_INTERFACE" >/dev/null || return 1
         fi
     done
 }
